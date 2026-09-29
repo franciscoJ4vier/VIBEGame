@@ -272,8 +272,8 @@ const SFX = {
 /* ══════════════════════════════════════════════════════════════
    CONFIGURACIÓN
    ══════════════════════════════════════════════════════════════ */
-const BASE_RESOLUTION_SCALE = isMobile ? 2 : 5.5;
-const MAX_RESOLUTION_SCALE = isMobile ? 5.5 : 12;
+const BASE_RESOLUTION_SCALE = isMobile ? 2 : 2;
+const MAX_RESOLUTION_SCALE = isMobile ? 5.5 : 4.0;
 let lowResDynamic = BASE_RESOLUTION_SCALE;
 const FIXED_SEED = 20240915;
 const GRID = 700;
@@ -305,6 +305,8 @@ const AMBIENT = 0.46, DIFFUSE = 0.72;
    ══════════════════════════════════════════════════════════════ */
 let scene, camera, renderer, postScene, postCam, postMat;
 let vmScene, vmCam, vmGroup, vmSway;
+let playerAvatar = null;
+let playerCamMode = 'first';
 let shipScene, shipCam, shipGroup;
 let carScene, carCam, carGroup;
 let renderTarget;
@@ -355,6 +357,8 @@ let deathScreenTimer = 0;
 let lastBannerChapter = '';
 
 let vehicleCamMode = 'third';
+let carLookYaw = 0;
+let carLookPitch = 0;
 
 const shipState = {
   x:0, y:60, z:0, yaw:0, pitch:0, roll:0,
@@ -388,6 +392,7 @@ const raceState = {
 const projectiles = [];
 let shipMesh = null;
 let carMesh = null;
+const carDoorAnim = { progress: 0, target: 0, timer: 0 };
 let flashlight = null;
 let flashlightEnabled = false;
 let weaponMode = 'pistol';
@@ -623,6 +628,52 @@ function buildViewmodel(){
   vmGroup.userData.rightHand = rightHand;
 }
 
+function buildPlayerAvatar(){
+  const avatar = new THREE.Group();
+  const skin = new THREE.MeshLambertMaterial({ color: 0xd9a273, flatShading: true });
+  const shirt = new THREE.MeshLambertMaterial({ color: 0x303b4a, flatShading: true });
+  const pants = new THREE.MeshLambertMaterial({ color: 0x20252c, flatShading: true });
+  const hair = new THREE.MeshLambertMaterial({ color: 0x241a16, flatShading: true });
+  const boots = new THREE.MeshLambertMaterial({ color: 0x101216, flatShading: true });
+
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.92, 0.38), shirt);
+  torso.position.y = 1.28;
+  avatar.add(torso);
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.13, 0.15, 0.20, 10), skin);
+  neck.position.y = 1.86;
+  avatar.add(neck);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(0.25, 16, 12), skin);
+  head.scale.set(0.88, 1.08, 0.88);
+  head.position.y = 2.16;
+  avatar.add(head);
+  const hairCap = new THREE.Mesh(new THREE.SphereGeometry(0.26, 16, 8, 0, Math.PI * 2, 0, Math.PI * 0.55), hair);
+  hairCap.position.set(0, 2.23, -0.01);
+  avatar.add(hairCap);
+
+  const legs = [];
+  for(const side of [-1, 1]){
+    const upperArm = new THREE.Mesh(new THREE.CylinderGeometry(0.10, 0.12, 0.62, 10), shirt);
+    upperArm.position.set(side * 0.48, 1.38, 0);
+    upperArm.rotation.z = side * 0.15;
+    avatar.add(upperArm);
+    const hand = new THREE.Mesh(new THREE.SphereGeometry(0.12, 10, 8), skin);
+    hand.position.set(side * 0.52, 1.03, -0.02);
+    avatar.add(hand);
+    const leg = new THREE.Mesh(new THREE.BoxGeometry(0.25, 0.78, 0.30), pants);
+    leg.position.set(side * 0.19, 0.48, 0);
+    avatar.add(leg);
+    legs.push(leg);
+    const boot = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.18, 0.44), boots);
+    boot.position.set(side * 0.19, 0.08, -0.08);
+    avatar.add(boot);
+  }
+  avatar.visible = false;
+  avatar.userData.walkPhase = 0;
+  avatar.userData.legs = legs;
+  scene.add(avatar);
+  playerAvatar = avatar;
+}
+
 function buildShipViewmodel(){
   shipGroup = new THREE.Group();
   shipScene.add(shipGroup);
@@ -663,6 +714,7 @@ function buildShipViewmodel(){
   shipGroup.userData.stickTop = stickTop;
 }
 
+// VERSION ANTIGUA: no editar. La version activa esta mas abajo, cerca de la linea 1192.
 function layoutCarCabin(){
   if(!carGroup || !carCam) return;
   const d = 1.0;
@@ -721,22 +773,47 @@ function layoutCarCabin(){
   if(grip){ grip.rotation.z = 0; }
 }
 
+/*
+  MAPA DE LA CABINA - PIEZAS 3D
+  871  Puertas laterales: doorL, doorR, doorL2, doorR2
+  913  Relojes del tablero: cluster
+  949  GPS y mapa: gps
+  968  Radio, altavoz y perillas: radio
+  1004 Piso interior: floor
+  1015 Asientos: makeSeat, seatL, seatR
+  1048 Parabrisas: windshield, windshieldTint
+  1053 Marco del parabrisas: windshieldTop, windshieldBottom
+  1059 Limpiaparabrisas: makeWiper, wiperL, wiperR
+  1074 Pedales: pedals
+  1108 Volante y manos: steeringGroup, createHand
+  1210 Posicion y escala de todas las piezas: layoutCarCabin activa
+*/
 function buildCarViewmodel(){
   const CAB = CAR_CAB;
+  // Materiales de la cabina: cambia aqui los colores y la transparencia.
   const mats = {
-    roof: new THREE.MeshBasicMaterial({ color: 0x0b0b0e }),
-    panel: new THREE.MeshBasicMaterial({ color: 0x050506 }),
+    roof: new THREE.MeshBasicMaterial({ color: 0x24272d }),
+    panel: new THREE.MeshBasicMaterial({ color: 0x121519 }),
     panelEdge: new THREE.MeshBasicMaterial({ color: 0x1a1c20 }),
     pillar: new THREE.MeshBasicMaterial({ color: 0x0e0f12 }),
-    dash: new THREE.MeshBasicMaterial({ color: 0x15171a }),
-    hood: new THREE.MeshBasicMaterial({ color: 0x0a0b0d }),
+    dash: new THREE.MeshLambertMaterial({ color: 0x9a896d, flatShading: true }),
+    hood: new THREE.MeshBasicMaterial({ color: 0x1d2025 }),
     console: new THREE.MeshBasicMaterial({ color: 0x101215 }),
-    door: new THREE.MeshBasicMaterial({ color: 0x0f1012 }),
+    door: new THREE.MeshLambertMaterial({ color: 0xb0102f, flatShading: true }),
+    doorInner: new THREE.MeshLambertMaterial({ color: 0x5a1d2a, flatShading: true }),
     plastic: new THREE.MeshBasicMaterial({ color: 0x23262b }),
     seamBlue: new THREE.MeshBasicMaterial({ color: 0x2f6fd0 }),
     seamRed: new THREE.MeshBasicMaterial({ color: 0xc0392b }),
-    skin: new THREE.MeshBasicMaterial({ color: 0xd9a273 }),
-    sleeve: new THREE.MeshBasicMaterial({ color: 0x2b2320 }),
+    skin: new THREE.MeshLambertMaterial({ color: 0xd9a273, flatShading: true }),
+    sleeve: new THREE.MeshLambertMaterial({ color: 0x2b2320, flatShading: true }),
+    shirt: new THREE.MeshLambertMaterial({ color: 0x303b4a, flatShading: true }),
+    pants: new THREE.MeshLambertMaterial({ color: 0x20252c, flatShading: true }),
+    hair: new THREE.MeshLambertMaterial({ color: 0x241a16, flatShading: true }),
+    shoe: new THREE.MeshLambertMaterial({ color: 0x101216, flatShading: true }),
+    belt: new THREE.MeshLambertMaterial({ color: 0x191b20, flatShading: true }),
+    wheelLeather: new THREE.MeshLambertMaterial({ color: 0x17191b, flatShading: true }),
+    wheelMetal: new THREE.MeshLambertMaterial({ color: 0x8a929b, flatShading: true }),
+    wheelAccent: new THREE.MeshLambertMaterial({ color: 0x3c4148, flatShading: true }),
     watch: new THREE.MeshBasicMaterial({ color: 0xb8bec6 }),
     trimDark: new THREE.MeshBasicMaterial({ color: 0x14181c }),
     trimLight: new THREE.MeshBasicMaterial({ color: 0xe9ecef }),
@@ -744,6 +821,9 @@ function buildCarViewmodel(){
     green: new THREE.MeshBasicMaterial({ color: 0x2e8b57 }),
     mirrorFace: new THREE.MeshBasicMaterial({ color: 0x4a505a }),
     mirrorFrame: new THREE.MeshBasicMaterial({ color: 0x15171a }),
+    sideWindow: new THREE.MeshBasicMaterial({ color: 0x263842, transparent: true, opacity: 0.38, depthWrite: false, side: THREE.DoubleSide }),
+    windshield: new THREE.MeshBasicMaterial({ color: 0x9fc5d8, transparent: true, opacity: 0.08, depthWrite: false, side: THREE.DoubleSide }),
+    windshieldTint: new THREE.MeshBasicMaterial({ color: 0xb9d8e5, transparent: true, opacity: 0.025, depthWrite: false }),
     accent: new THREE.MeshBasicMaterial({ color: 0x6b7480 }),
     darkMetal: new THREE.MeshBasicMaterial({ color: 0x1b1d20 }),
     innerMetal: new THREE.MeshBasicMaterial({ color: 0x23262b }),
@@ -751,10 +831,70 @@ function buildCarViewmodel(){
 
   carGroup = new THREE.Group();
   carScene.add(carGroup);
+  carScene.add(new THREE.HemisphereLight(0xe5eaf0, 0x332b27, 1.15));
+  const cabinLight = new THREE.DirectionalLight(0xffdfbd, 0.65);
+  cabinLight.position.set(-0.5, 0.8, 1);
+  carScene.add(cabinLight);
 
   const parts = {};
   const addPart = (name, mesh) => { parts[name] = mesh; carGroup.add(mesh); return mesh; };
 
+  // Pantallas con texto: se dibujan en un canvas y luego se colocan en el tablero.
+  const makeDisplayMaterial = (lines, color='#9cff8e') => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 256; canvas.height = 128;
+    const ctx = canvas.getContext('2d');
+    ctx.fillStyle = '#101719';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = color;
+    ctx.font = 'bold 25px monospace';
+    ctx.textAlign = 'center';
+    lines.forEach((line, index) => ctx.fillText(line, 128, 48 + index * 34));
+    return new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(canvas) });
+  };
+
+  const makeSwitchPanel = (rows, columns, colors) => {
+    const panel = new THREE.Group();
+    panel.add(new THREE.Mesh(new THREE.BoxGeometry(1, 0.78, 0.055), mats.wheelAccent));
+    panel.add(new THREE.Mesh(new THREE.BoxGeometry(0.94, 0.72, 0.018), mats.door));
+    for(let row = 0; row < rows; row++){
+      for(let column = 0; column < columns; column++){
+        const x = (column - (columns - 1) / 2) * 0.28;
+        const y = (rows - 1) * 0.13 - row * 0.26;
+        const button = new THREE.Mesh(new THREE.BoxGeometry(0.21, 0.17, 0.035), mats.panelEdge);
+        button.position.set(x, y, 0.035);
+        panel.add(button);
+        const cap = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.10, 0.018), colors[(row * columns + column) % colors.length]);
+        cap.position.set(x, y, 0.061);
+        panel.add(cap);
+        const lamp = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.018, 0.01), (row + column) % 3 === 0 ? mats.green : mats.trimDark);
+        lamp.position.set(x, y - 0.055, 0.074);
+        panel.add(lamp);
+      }
+    }
+    return panel;
+  };
+
+  // GPS/mapa que aparece a la izquierda del volante.
+  const mapCanvas = document.createElement('canvas');
+  mapCanvas.width = 192; mapCanvas.height = 128;
+  const mapContext = mapCanvas.getContext('2d');
+  mapContext.fillStyle = '#d1bd8b';
+  mapContext.fillRect(0, 0, 192, 128);
+  mapContext.fillStyle = '#75999b';
+  mapContext.beginPath(); mapContext.moveTo(0, 0); mapContext.lineTo(48, 0); mapContext.lineTo(30, 52); mapContext.lineTo(0, 72); mapContext.fill();
+  mapContext.fillStyle = '#647d50';
+  mapContext.beginPath(); mapContext.moveTo(74, 0); mapContext.lineTo(150, 0); mapContext.lineTo(122, 52); mapContext.lineTo(161, 89); mapContext.lineTo(95, 128); mapContext.lineTo(62, 77); mapContext.fill();
+  mapContext.strokeStyle = '#ead29b'; mapContext.lineWidth = 7; mapContext.beginPath();
+  mapContext.moveTo(26, 112); mapContext.lineTo(70, 82); mapContext.lineTo(103, 87); mapContext.lineTo(136, 43); mapContext.lineTo(176, 28); mapContext.stroke();
+  mapContext.strokeStyle = '#b84e38'; mapContext.lineWidth = 3; mapContext.beginPath();
+  mapContext.moveTo(35, 102); mapContext.lineTo(75, 73); mapContext.lineTo(111, 80); mapContext.lineTo(145, 46); mapContext.stroke();
+  mapContext.fillStyle = '#f7f0dc'; mapContext.beginPath(); mapContext.arc(75, 73, 5, 0, Math.PI * 2); mapContext.fill();
+  const mapMaterial = new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(mapCanvas) });
+
+  const switchColors = [mats.trimLight, mats.green, mats.seamRed, mats.accent];
+
+  // Estructura principal: techo, tablero, pilares y espejos.
   const headliner = new THREE.Mesh(new THREE.BoxGeometry(1.2, 0.18, 0.03), mats.roof);
   headliner.userData.kind = 'headliner';
   addPart('headliner', headliner);
@@ -786,14 +926,68 @@ function buildCarViewmodel(){
   const mirrorR = mirrorL.clone();
   addPart('mirrorR', mirrorR);
 
-  const doorL = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.52, 0.02), mats.door);
+  const doorL = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.52, 0.02), mats.doorInner);
   addPart('doorL', doorL);
-  const doorL2 = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.18, 0.02), mats.door);
+  const doorL2 = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.18, 0.02), mats.doorInner);
   addPart('doorL2', doorL2);
   const doorR = doorL.clone();
   addPart('doorR', doorR);
   const doorR2 = doorL2.clone();
   addPart('doorR2', doorR2);
+
+  // Detalles interiores de las puertas: panel, manija y apoyabrazos.
+  const doorHandleL = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.035, 0.025), mats.wheelMetal);
+  addPart('doorHandleL', doorHandleL);
+  const doorHandleR = doorHandleL.clone();
+  addPart('doorHandleR', doorHandleR);
+  const armrestL = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.07, 0.06), mats.panelEdge);
+  addPart('armrestL', armrestL);
+  const armrestR = armrestL.clone();
+  addPart('armrestR', armrestR);
+  const sidePanelL = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.86, 0.08), mats.doorInner);
+  addPart('sidePanelL', sidePanelL);
+  const sidePanelR = sidePanelL.clone();
+  addPart('sidePanelR', sidePanelR);
+  const sideFrameL = new THREE.Mesh(new THREE.BoxGeometry(0.10, 1.02, 0.07), mats.pillar);
+  addPart('sideFrameL', sideFrameL);
+  const sideFrameR = sideFrameL.clone();
+  addPart('sideFrameR', sideFrameR);
+  const pillarBL = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.72, 0.07), mats.pillar);
+  addPart('pillarBL', pillarBL);
+  const pillarBR = pillarBL.clone();
+  addPart('pillarBR', pillarBR);
+  const roofRailL = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.08, 1.10), mats.pillar);
+  addPart('roofRailL', roofRailL);
+  const roofRailR = roofRailL.clone();
+  addPart('roofRailR', roofRailR);
+  const sideWindowL = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.16, 0.025), mats.sideWindow);
+  addPart('sideWindowL', sideWindowL);
+  const sideWindowR = sideWindowL.clone();
+  addPart('sideWindowR', sideWindowR);
+  const windowButtonL = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.025, 0.025), mats.wheelMetal);
+  addPart('windowButtonL', windowButtonL);
+  const windowButtonR = windowButtonL.clone();
+  addPart('windowButtonR', windowButtonR);
+
+  // Piso lateral continuo hasta las puertas.
+  const floorSideL = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.05, 1.25), mats.trimDark);
+  addPart('floorSideL', floorSideL);
+  const floorSideR = floorSideL.clone();
+  addPart('floorSideR', floorSideR);
+
+  // Alas envolventes del tablero y visera del cluster.
+  const dashWingL = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.28, 0.05), mats.dash);
+  addPart('dashWingL', dashWingL);
+  const dashWingR = dashWingL.clone();
+  addPart('dashWingR', dashWingR);
+  const clusterVisor = new THREE.Mesh(new THREE.BoxGeometry(0.50, 0.10, 0.06), mats.hood);
+  addPart('clusterVisor', clusterVisor);
+
+  // Rejillas de ventilacion del tablero.
+  const ventL = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.07, 0.025), mats.panelEdge);
+  addPart('ventL', ventL);
+  const ventR = ventL.clone();
+  addPart('ventR', ventR);
 
   const seamBlueL = new THREE.Mesh(new THREE.BoxGeometry(0.016, 0.16, 0.005), mats.seamBlue);
   const seamBlueL2 = seamBlueL.clone();
@@ -806,6 +1000,7 @@ function buildCarViewmodel(){
   doorL.add(seamBlueL, seamRedL, seamBlueL2, seamRedL2);
   doorR.add(seamBlueR, seamRedR, seamBlueR2, seamRedR2);
 
+  // Consola central pequena con perillas y tira roja.
   const consoleBlock = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.18, 0.04), mats.console);
   addPart('console', consoleBlock);
   const knob1 = new THREE.Mesh(new THREE.CylinderGeometry(0.022, 0.022, 0.02, 16), mats.plastic);
@@ -826,27 +1021,98 @@ function buildCarViewmodel(){
   redBlock.position.set(0.04, 0.0, 0.012);
   screen.add(redBlock);
 
+  // Cluster de instrumentos: velocimetro, tacometro y agujas.
   const cluster = new THREE.Group();
   addPart('cluster', cluster);
   const clusterBase = new THREE.Mesh(new THREE.BoxGeometry(0.36, 0.16, 0.02), mats.hood);
   cluster.add(clusterBase);
-  const leftDial = new THREE.Mesh(new THREE.CircleGeometry(0.07, 24), mats.trimDark);
-  leftDial.position.set(-0.12, 0.0, 0.02);
-  const leftDialA = new THREE.Mesh(new THREE.RingGeometry(0.055, 0.065, 28), mats.trimLight);
-  leftDialA.position.copy(leftDial.position).setZ(0.022);
-  const leftNeedle = new THREE.Mesh(new THREE.BoxGeometry(0.008, 0.03, 0.005), mats.red);
-  leftNeedle.position.set(-0.12, 0.0, 0.024);
-  leftNeedle.rotation.z = -2.0;
-  cluster.add(leftDial, leftDialA, leftNeedle);
-  const rightDial = leftDial.clone();
-  rightDial.position.x = 0.06;
-  const rightDialA = leftDialA.clone();
-  rightDialA.position.copy(rightDial.position).setZ(0.022);
-  const rightNeedle = leftNeedle.clone();
-  rightNeedle.position.x = 0.06;
-  rightNeedle.rotation.z = 0.3;
-  cluster.add(rightDial, rightDialA, rightNeedle);
+  const makeGauge = (x, accent) => {
+    const gauge = new THREE.Group();
+    gauge.position.x = x;
+    const face = new THREE.Mesh(new THREE.CircleGeometry(0.095, 28), mats.trimDark);
+    face.position.z = 0.025;
+    const rim = new THREE.Mesh(new THREE.RingGeometry(0.086, 0.102, 32), mats.trimLight);
+    rim.position.z = 0.027;
+    gauge.add(face, rim);
+    for(let tick = 0; tick < 11; tick++){
+      const angle = -1.28 + tick * 0.256;
+      const mark = new THREE.Mesh(new THREE.BoxGeometry(0.005, tick % 5 === 0 ? 0.019 : 0.012, 0.004), mats.trimLight);
+      mark.position.set(Math.sin(angle) * 0.071, Math.cos(angle) * 0.071, 0.031);
+      mark.rotation.z = -angle;
+      gauge.add(mark);
+    }
+    const needle = new THREE.Mesh(new THREE.BoxGeometry(0.006, 0.057, 0.004), accent);
+    const needlePivot = new THREE.Group();
+    needlePivot.position.z = 0.034;
+    needle.position.set(0, 0.027, 0.002);
+    needlePivot.add(needle);
+    gauge.add(needlePivot);
+    const center = new THREE.Mesh(new THREE.CircleGeometry(0.012, 12), mats.trimLight);
+    center.position.set(0, 0, 0.039);
+    gauge.add(center);
+    cluster.add(gauge);
+    return needlePivot;
+  };
+  const leftDial = makeGauge(-0.205, mats.seamRed);
+  const middleDial = makeGauge(0, mats.trimLight);
+  const rightDial = makeGauge(0.205, mats.seamRed);
 
+  // Modulo GPS con mapa y tornillos de montaje.
+  const gps = new THREE.Group();
+  gps.add(new THREE.Mesh(new THREE.BoxGeometry(1, 0.76, 0.07), mats.wheelAccent));
+  const gpsScreen = new THREE.Mesh(new THREE.BoxGeometry(0.88, 0.62, 0.012), mapMaterial);
+  gpsScreen.position.z = 0.043;
+  gps.add(gpsScreen);
+  for(let screwIndex = 0; screwIndex < 4; screwIndex++){
+    const screw = new THREE.Mesh(new THREE.CircleGeometry(0.018, 10), mats.wheelMetal);
+    screw.position.set(screwIndex % 2 ? 0.44 : -0.44, screwIndex < 2 ? 0.31 : -0.31, 0.05);
+    gps.add(screw);
+  }
+  addPart('gps', gps);
+
+  // Paneles de botones izquierdo y derecho.
+  const leftSwitchPanel = makeSwitchPanel(4, 3, switchColors);
+  addPart('switchLeft', leftSwitchPanel);
+  const rightSwitchPanel = makeSwitchPanel(3, 4, switchColors);
+  addPart('switchRight', rightSwitchPanel);
+
+  // Radio, pantalla, altavoz, perillas y botones.
+  const radio = new THREE.Group();
+  radio.add(new THREE.Mesh(new THREE.BoxGeometry(1, 0.78, 0.07), mats.wheelAccent));
+  const radioDisplay = new THREE.Mesh(new THREE.BoxGeometry(0.72, 0.22, 0.015), makeDisplayMaterial(['RADIO  FM', '104.8  MHz'], '#a9d8ff'));
+  radioDisplay.position.set(0, 0.23, 0.045);
+  radio.add(radioDisplay);
+  const speaker = new THREE.Mesh(new THREE.BoxGeometry(0.35, 0.24, 0.018), mats.panel);
+  speaker.position.set(-0.25, -0.19, 0.045);
+  radio.add(speaker);
+  for(let row = 0; row < 3; row++) for(let column = 0; column < 5; column++){
+    const hole = new THREE.Mesh(new THREE.CircleGeometry(0.012, 8), mats.trimDark);
+    hole.position.set(-0.38 + column * 0.065, -0.27 + row * 0.065, 0.057);
+    radio.add(hole);
+  }
+  for(const x of [0.24, 0.39]){
+    const knob = new THREE.Mesh(new THREE.CylinderGeometry(0.055, 0.055, 0.045, 16), mats.wheelMetal);
+    knob.rotation.x = Math.PI / 2;
+    knob.position.set(x, -0.18, 0.06);
+    radio.add(knob);
+  }
+  addPart('radio', radio);
+
+  // Pantalla de marcha y palanca de cambios.
+  const gearDisplay = new THREE.Mesh(new THREE.BoxGeometry(1, 0.58, 0.025), makeDisplayMaterial(['GEAR: 1', 'BOOST: OK'], '#91ff87'));
+  addPart('gearDisplay', gearDisplay);
+
+  const gearLever = new THREE.Group();
+  gearLever.add(new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.28, 0.10), mats.panel));
+  const leverStem = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.045, 0.30, 10), mats.wheelMetal);
+  leverStem.position.set(0, 0.20, 0.035);
+  gearLever.add(leverStem);
+  const leverKnob = new THREE.Mesh(new THREE.SphereGeometry(0.09, 12, 10), mats.darkMetal);
+  leverKnob.position.set(0, 0.36, 0.035);
+  gearLever.add(leverKnob);
+  addPart('gearLever', gearLever);
+
+  // Piso interior, panel inferior y asientos.
   const floor = new THREE.Mesh(new THREE.BoxGeometry(1.12, 0.05, 1.8), mats.trimDark);
   floor.position.set(0, -0.72, 0.18);
   addPart('floor', floor);
@@ -879,17 +1145,56 @@ function buildCarViewmodel(){
   addPart('seatL', seatL);
   addPart('seatR', seatR);
 
-  const doorTrimL = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.54, 0.04), mats.door);
+  const doorTrimL = new THREE.Mesh(new THREE.BoxGeometry(0.12, 0.54, 0.04), mats.doorInner);
   doorTrimL.position.set(-0.78, -0.18, 0.18);
   addPart('doorTrimL', doorTrimL);
   const doorTrimR = doorTrimL.clone();
   doorTrimR.position.x = 0.78;
   addPart('doorTrimR', doorTrimR);
 
+  // Techo interior y parabrisas frontal.
   const roof = new THREE.Mesh(new THREE.BoxGeometry(1.08, 0.16, 1.30), mats.roof);
   roof.position.set(0, 0.46, 0.08);
   addPart('roof', roof);
 
+  const windshield = new THREE.Mesh(new THREE.PlaneGeometry(1.8, 0.82), mats.windshield);
+  addPart('windshield', windshield);
+  const windshieldTint = new THREE.Mesh(new THREE.PlaneGeometry(1.72, 0.74), mats.windshieldTint);
+  addPart('windshieldTint', windshieldTint);
+
+  const windshieldTop = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.07, 0.04), mats.pillar);
+  addPart('windshieldTop', windshieldTop);
+  const windshieldBottom = new THREE.Mesh(new THREE.BoxGeometry(1.9, 0.055, 0.04), mats.pillar);
+  addPart('windshieldBottom', windshieldBottom);
+
+  // Limpiaparabrisas izquierdo y derecho.
+  const makeWiper = (x, rotation) => {
+    const wiper = new THREE.Group();
+    const arm = new THREE.Mesh(new THREE.BoxGeometry(0.035, 0.48, 0.018), mats.darkMetal);
+    arm.rotation.z = rotation;
+    const blade = new THREE.Mesh(new THREE.BoxGeometry(0.028, 0.36, 0.025), mats.trimDark);
+    blade.position.y = rotation < 0 ? -0.10 : 0.10;
+    blade.rotation.z = rotation;
+    wiper.add(arm, blade);
+    wiper.position.x = x;
+    addPart(x < 0 ? 'wiperL' : 'wiperR', wiper);
+  };
+  makeWiper(-0.25, -0.18);
+  makeWiper(0.25, 0.18);
+
+  // Pedales de freno y acelerador.
+  const pedals = new THREE.Group();
+  const pedalBase = new THREE.Mesh(new THREE.BoxGeometry(0.34, 0.08, 0.04), mats.panel);
+  pedalBase.position.y = -0.18;
+  const pedalBrake = new THREE.Mesh(new THREE.BoxGeometry(0.10, 0.18, 0.055), mats.wheelMetal);
+  pedalBrake.position.set(-0.06, -0.07, 0.035);
+  const pedalGas = pedalBrake.clone();
+  pedalGas.scale.set(0.72, 0.86, 1);
+  pedalGas.position.set(0.09, -0.08, 0.035);
+  pedals.add(pedalBase, pedalBrake, pedalGas);
+  addPart('pedals', pedals);
+
+  // Testigos pequenos del tablero superior.
   const leftPod = new THREE.Mesh(new THREE.CircleGeometry(0.05, 22), mats.trimDark);
   const leftPodRing = new THREE.Mesh(new THREE.RingGeometry(0.04, 0.046, 22), mats.seamRed);
   leftPodRing.position.z = 0.01;
@@ -911,79 +1216,101 @@ function buildCarViewmodel(){
   leftPod2.scale.setScalar(0.8);
   addPart('leftPod2', leftPod2);
 
+  // Volante, radios, centro y emblema.
   const steeringGroup = new THREE.Group();
-  steeringGroup.rotation.x = -0.35;
+  steeringGroup.rotation.x = -0.36;
   addPart('wheelGroup', steeringGroup);
 
-  const steeringRing = new THREE.Mesh(new THREE.TorusGeometry(0.22, 0.032, 12, 40), mats.darkMetal);
-  steeringRing.rotation.y = Math.PI / 2;
-  steeringRing.rotation.x = Math.PI / 2;
+  const steeringRing = new THREE.Mesh(new THREE.TorusGeometry(0.36, 0.045, 14, 48), mats.wheelLeather);
   steeringGroup.add(steeringRing);
 
-  const steeringTrim = new THREE.Mesh(new THREE.TorusGeometry(0.17, 0.016, 8, 28), mats.trimLight);
-  steeringTrim.rotation.y = Math.PI / 2;
-  steeringTrim.rotation.x = Math.PI / 2;
-  steeringTrim.position.z = 0.013;
+  const steeringTrim = new THREE.Mesh(new THREE.TorusGeometry(0.31, 0.009, 8, 40), mats.wheelMetal);
+  steeringTrim.position.z = 0.025;
   steeringGroup.add(steeringTrim);
 
-  const steeringCut = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.12, 0.03), mats.door);
-  steeringCut.position.set(0, -0.08, 0.015);
-  steeringGroup.add(steeringCut);
+  const spokeLeft = new THREE.Mesh(new THREE.BoxGeometry(0.045, 0.29, 0.045), mats.wheelAccent);
+  spokeLeft.position.set(-0.12, 0.12, 0.012);
+  spokeLeft.rotation.z = 0.78;
+  const spokeRight = spokeLeft.clone();
+  spokeRight.position.x = 0.12;
+  spokeRight.rotation.z = -0.78;
+  const spokeBottom = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.34, 0.045), mats.wheelAccent);
+  spokeBottom.position.set(0, -0.17, 0.012);
+  steeringGroup.add(spokeLeft, spokeRight, spokeBottom);
 
-  const hubCore = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.06, 0.06, 18), mats.innerMetal);
+  const hubCore = new THREE.Mesh(new THREE.CylinderGeometry(0.095, 0.095, 0.06, 24), mats.wheelAccent);
   hubCore.rotation.x = Math.PI / 2;
+  hubCore.position.z = 0.012;
   steeringGroup.add(hubCore);
 
-  const hubEmblem = new THREE.Mesh(new THREE.CircleGeometry(0.018, 20), mats.seamBlue);
-  hubEmblem.position.z = 0.035;
-  hubCore.add(hubEmblem);
+  const hubFace = new THREE.Mesh(new THREE.CircleGeometry(0.068, 24), mats.darkMetal);
+  hubFace.position.z = 0.047;
+  steeringGroup.add(hubFace);
+  const hubEmblem = new THREE.Mesh(new THREE.RingGeometry(0.028, 0.04, 20), mats.trimLight);
+  hubEmblem.position.z = 0.05;
+  steeringGroup.add(hubEmblem);
+  const emblemCore = new THREE.Mesh(new THREE.CircleGeometry(0.022, 16), mats.seamBlue);
+  emblemCore.position.z = 0.051;
+  steeringGroup.add(emblemCore);
 
-  const spokeGeo = new THREE.BoxGeometry(0.025, 0.12, 0.014);
-  for(let i = 0; i < 4; i++){
-    const spoke = new THREE.Mesh(spokeGeo, mats.plastic);
-    spoke.rotation.z = i * (Math.PI * 2 / 4) + Math.PI / 2;
-    spoke.position.set(0, 0.0, 0.006);
-    steeringGroup.add(spoke);
-  }
-  const gripPad = new THREE.Mesh(new THREE.TorusGeometry(0.13, 0.016, 8, 28), mats.trimDark);
-  gripPad.rotation.y = Math.PI / 2;
-  gripPad.rotation.x = Math.PI / 2;
-  gripPad.position.z = 0.025;
-  steeringGroup.add(gripPad);
+  // Manos y antebrazos del conductor.
+  const createHand = side => {
+    const hand = new THREE.Group();
+    const palm = new THREE.Mesh(new THREE.SphereGeometry(1, 14, 10), mats.skin);
+    palm.scale.set(0.13, 0.09, 0.055);
+    hand.add(palm);
+    for(let fingerIndex = 0; fingerIndex < 4; fingerIndex++){
+      const finger = new THREE.Mesh(new THREE.CylinderGeometry(0.013, 0.016, 0.13, 8), mats.skin);
+      finger.rotation.z = side * Math.PI / 2;
+      finger.position.set(-side * 0.055, (fingerIndex - 1.5) * 0.032, 0.045);
+      hand.add(finger);
+      const fingertip = new THREE.Mesh(new THREE.SphereGeometry(0.016, 8, 6), mats.skin);
+      fingertip.position.set(-side * 0.115, (fingerIndex - 1.5) * 0.032, 0.045);
+      hand.add(fingertip);
+    }
+    const thumb = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.019, 0.11, 8), mats.skin);
+    thumb.rotation.z = side * 0.55;
+    thumb.position.set(-side * 0.06, -0.005, 0.05);
+    hand.add(thumb);
+    hand.position.set(side * 0.24, 0.23, 0.075);
+    steeringGroup.add(hand);
+    return hand;
+  };
+  const leftHand = createHand(-1);
+  const rightHand = createHand(1);
 
-  const leftHand = new THREE.Mesh(new THREE.SphereGeometry(0.06, 12, 10), mats.skin);
-  leftHand.scale.set(1.0, 0.86, 0.92);
-  leftHand.position.set(-0.33, -0.18, -0.08);
-  steeringGroup.add(leftHand);
-  const rightHand = new THREE.Mesh(new THREE.SphereGeometry(0.06, 12, 10), mats.skin);
-  rightHand.scale.set(1.0, 0.86, 0.92);
-  rightHand.position.set(0.08, -0.18, -0.08);
-  steeringGroup.add(rightHand);
-
-  const leftForearm = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.032, 0.28, 12), mats.sleeve);
-  leftForearm.rotation.z = -0.8;
-  leftForearm.position.set(-0.48, -0.42, -0.08);
+  const leftForearm = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.095, 1.15, 14), mats.skin);
+  leftForearm.rotation.z = -0.45;
+  leftForearm.position.set(-0.39, -0.15, 0.015);
   steeringGroup.add(leftForearm);
-  const rightForearm = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.032, 0.28, 12), mats.sleeve);
-  rightForearm.rotation.z = 0.7;
-  rightForearm.position.set(0.23, -0.42, -0.08);
+  const rightForearm = new THREE.Mesh(new THREE.CylinderGeometry(0.065, 0.095, 1.15, 14), mats.skin);
+  rightForearm.rotation.z = 0.45;
+  rightForearm.position.set(0.39, -0.15, 0.015);
   steeringGroup.add(rightForearm);
 
-  const leftPalm = new THREE.Mesh(new THREE.SphereGeometry(0.045, 12, 10), mats.skin);
-  leftPalm.scale.set(1.15, 0.7, 1.0);
-  leftPalm.position.set(-0.18, -0.28, -0.12);
-  steeringGroup.add(leftPalm);
-  const rightPalm = new THREE.Mesh(new THREE.SphereGeometry(0.045, 12, 10), mats.skin);
-  rightPalm.scale.set(1.15, 0.7, 1.0);
-  rightPalm.position.set(0.18, -0.28, -0.12);
-  steeringGroup.add(rightPalm);
-
-  const watchBandL = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.08, 0.008), mats.watch);
-  watchBandL.position.set(-0.09, -0.20, 0.02);
-  leftForearm.add(watchBandL);
-  const watchBandR = watchBandL.clone();
-  watchBandR.position.x = 0.10;
-  rightForearm.add(watchBandR);
+  // Cuerpo visible del conductor: torso, cinturon, piernas y zapatos.
+  const torso = new THREE.Mesh(new THREE.BoxGeometry(0.48, 0.42, 0.20), mats.shirt);
+  addPart('torso', torso);
+  const neck = new THREE.Mesh(new THREE.CylinderGeometry(0.075, 0.09, 0.16, 12), mats.skin);
+  addPart('neck', neck);
+  const head = new THREE.Group();
+  const face = new THREE.Mesh(new THREE.SphereGeometry(0.16, 16, 12), mats.skin);
+  face.scale.set(0.88, 1.08, 0.86);
+  head.add(face);
+  const hair = new THREE.Mesh(new THREE.SphereGeometry(0.165, 16, 8, 0, Math.PI * 2, 0, Math.PI * 0.55), mats.hair || mats.pants);
+  hair.position.y = 0.05;
+  head.add(hair);
+  addPart('head', head);
+  const belt = new THREE.Mesh(new THREE.BoxGeometry(0.52, 0.035, 0.035), mats.belt);
+  addPart('belt', belt);
+  const legL = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.48, 0.22), mats.pants);
+  addPart('legL', legL);
+  const legR = legL.clone();
+  addPart('legR', legR);
+  const shoeL = new THREE.Mesh(new THREE.BoxGeometry(0.18, 0.10, 0.32), mats.shoe);
+  addPart('shoeL', shoeL);
+  const shoeR = shoeL.clone();
+  addPart('shoeR', shoeR);
 
   carGroup.userData.parts = parts;
   carGroup.userData.steeringGroup = steeringGroup;
@@ -991,8 +1318,9 @@ function buildCarViewmodel(){
   carGroup.userData.rightHand = rightHand;
   carGroup.userData.leftForearm = leftForearm;
   carGroup.userData.rightForearm = rightForearm;
-  carGroup.userData.leftDial = leftNeedle;
-  carGroup.userData.rightDial = rightNeedle;
+  carGroup.userData.leftDial = leftDial;
+  carGroup.userData.rightDial = rightDial;
+  carGroup.userData.middleDial = middleDial;
   carGroup.userData.leftPod = leftPod;
   carGroup.userData.rightPod = rightPod;
   carGroup.userData.floor = floor;
@@ -1013,6 +1341,566 @@ function buildCarViewmodel(){
   layoutCarCabin();
 }
 
+// ===== CASCARON LATERAL DE LA CABINA =====
+// Puertas, ventanas, pilares A/B y techo lateral. Se calcula en coordenadas de pantalla (NDC)
+// para llenar SIEMPRE los costados sin importar el ancho de la pantalla.
+// Cada pieza: puntos [x,y] del lado izquierdo (x positivo aqui = hacia el borde). El derecho se refleja solo.
+// Ajusta aqui: puntos (forma), z (profundidad: mas negativo = mas lejos) y color.
+const CABIN_SHELL_PIECES = [
+  // ventana lateral (transparente, al fondo)
+  { name:'glass',   z:-1.15, color:0x263842, opacity:0.30, pts:[[1.03,-0.12],[0.86,-0.20],[0.63,0.74],[1.03,0.64]] },
+  // panel de puerta (parte interior tapizada)
+  { name:'door',    z:-0.92, color:0x6a1a2b, pts:[[1.03,-1.03],[0.60,-1.03],[0.60,-0.32],[1.03,-0.12]] },
+  // bolsillo inferior de la puerta
+  { name:'pocket',  z:-0.91, color:0x2a0f16, pts:[[1.00,-1.00],[0.68,-1.00],[0.68,-0.66],[1.00,-0.60]] },
+  // borde superior de la puerta (linea de cintura, color carroceria)
+  { name:'sill',    z:-0.90, color:0xb0102f, pts:[[1.03,-0.12],[0.60,-0.32],[0.60,-0.42],[1.03,-0.22]] },
+  // apoyabrazos
+  { name:'armrest', z:-0.89, color:0x15171b, pts:[[1.00,-0.47],[0.72,-0.54],[0.72,-0.62],[1.00,-0.55]] },
+  // manija / boton de ventana
+  { name:'handle',  z:-0.88, color:0x9aa0a6, pts:[[0.95,-0.435],[0.79,-0.475],[0.79,-0.495],[0.95,-0.455]] },
+  // pilar A: ancho e inclinado, converge hacia arriba
+  { name:'pillarA', z:-1.00, color:0x0e0f12, pts:[[0.88,-0.19],[0.62,-0.33],[0.44,0.78],[0.64,0.75]] },
+  // techo lateral (riel)
+  { name:'rail',    z:-1.00, color:0x0e0f12, pts:[[0.44,0.78],[1.03,0.64],[1.03,1.05],[0.44,1.05]] },
+  // marco del borde (pilar B)
+  { name:'pillarB', z:-0.99, color:0x0e0f12, pts:[[0.95,-0.12],[1.03,-0.12],[1.03,0.64],[0.95,0.64]] },
+];
+
+function buildCabinSideShell(p, hw, hh){
+  // Ocultar las piezas laterales viejas que este cascaron reemplaza.
+  ['doorL','doorR','doorL2','doorR2','doorTrimL','doorTrimR','sidePanelL','sidePanelR',
+   'sideFrameL','sideFrameR','pillarL','pillarR','pillarBL','pillarBR','roofRailL','roofRailR',
+   'sideWindowL','sideWindowR','doorHandleL','doorHandleR','armrestL','armrestR',
+   'windowButtonL','windowButtonR'].forEach(n => { if(p[n]) p[n].visible = false; });
+
+  let shell = carGroup.userData.sideShell;
+  if(!shell){
+    shell = new THREE.Group();
+    shell.userData.meshes = [];
+    CABIN_SHELL_PIECES.forEach(def => {
+      [-1, 1].forEach(side => {
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(12), 3));
+        geo.setIndex([0,1,2, 0,2,3]);
+        const mat = new THREE.MeshBasicMaterial({
+          color: def.color,
+          side: THREE.DoubleSide,
+          transparent: def.opacity !== undefined,
+          opacity: def.opacity !== undefined ? def.opacity : 1,
+          depthWrite: def.opacity === undefined,
+        });
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.frustumCulled = false;
+        shell.add(mesh);
+        shell.userData.meshes.push({ mesh, def, side });
+      });
+    });
+    carGroup.add(shell);
+    carGroup.userData.sideShell = shell;
+    shell.userData.key = '';
+  }
+
+  const key = hw.toFixed(4) + '|' + hh.toFixed(4);
+  if(shell.userData.key !== key){
+    shell.userData.key = key;
+    shell.userData.meshes.forEach(({ mesh, def, side }) => {
+      const arr = mesh.geometry.attributes.position.array;
+      def.pts.forEach((pt, i) => {
+        arr[i*3]     = pt[0] * side * hw;
+        arr[i*3 + 1] = pt[1] * hh;
+        arr[i*3 + 2] = def.z;
+      });
+      mesh.geometry.attributes.position.needsUpdate = true;
+      mesh.geometry.computeBoundingSphere();
+    });
+  }
+
+  buildCabinRoom(hw, hh);
+
+  // Espejos laterales sobre la ventana, delante del cristal.
+  buildCabinMirrors(p, hw, hh);
+}
+
+// ===== HABITACULO COMPLETO =====
+// Paredes laterales continuas (puerta -> ventana -> techo), piso, techo y parte trasera,
+// para que al girar la cabeza no se vea el mundo por dentro de la cabina.
+// Ajusta aqui: colores, largo del habitaculo (ROOM_Z_BACK) y alturas (en fracciones de la pantalla).
+const ROOM_Z_FRONT = -0.92;   // donde empieza (coincide con los paneles de puerta delanteros)
+const ROOM_Z_BACK  = 1.60;    // donde termina la parte trasera
+const ROOM_COL = { door:0x6a1a2b, sill:0xb0102f, dark:0x0e0f12, floor:0x26262c, glass:0x263842 };
+
+function cabinRoomSpecs(hw, hh){
+  const xw = 1.03 * hw, yF = -1.03 * hh;
+  const z0 = ROOM_Z_FRONT, z1 = ROOM_Z_BACK, zc = (z0 + z1) / 2, zl = z1 - z0;
+  const bands = [
+    [yF,        -0.22*hh, ROOM_COL.door],
+    [-0.22*hh,  -0.12*hh, ROOM_COL.sill],
+    [-0.12*hh,   0.64*hh, ROOM_COL.glass, 0.30],
+    [ 0.64*hh,   0.90*hh, ROOM_COL.dark],
+  ];
+  const out = [];
+  [-1, 1].forEach(s => {
+    bands.forEach(b => out.push({ axis:'x', c:[s*xw, (b[0]+b[1])/2, zc], w:zl, h:b[1]-b[0], color:b[2], opacity:b[3] }));
+    [0.25, 1.50].forEach(zp => out.push({ axis:'x', c:[s*(xw-0.01), 0.26*hh, zp], w:0.16, h:0.76*hh, color:ROOM_COL.dark }));
+  });
+  bands.forEach(b => out.push({ axis:'z', c:[0, (b[0]+b[1])/2, z1], w:2*xw, h:b[1]-b[0], color:b[2], opacity:b[3] }));
+  out.push({ axis:'y', c:[0, yF, zc], w:2*xw, h:zl, color:ROOM_COL.floor });
+  out.push({ axis:'y', c:[0, 0.90*hh, zc], w:2*xw, h:zl, color:ROOM_COL.dark });
+  return out;
+}
+
+function buildCabinRoom(hw, hh){
+  const specs = cabinRoomSpecs(hw, hh);
+  let room = carGroup.userData.room;
+  if(!room){
+    room = new THREE.Group();
+    room.userData.meshes = specs.map(sp => {
+      const mat = new THREE.MeshBasicMaterial({
+        color: sp.color, side: THREE.DoubleSide,
+        transparent: sp.opacity !== undefined, opacity: sp.opacity !== undefined ? sp.opacity : 1,
+        depthWrite: sp.opacity === undefined,
+      });
+      const mesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), mat);
+      mesh.frustumCulled = false;
+      if(sp.axis === 'x') mesh.rotation.y = Math.PI / 2;
+      if(sp.axis === 'y') mesh.rotation.x = Math.PI / 2;
+      room.add(mesh);
+      return mesh;
+    });
+    carGroup.add(room);
+    carGroup.userData.room = room;
+    room.userData.key = '';
+  }
+  const key = hw.toFixed(4) + '|' + hh.toFixed(4);
+  if(room.userData.key === key) return;
+  room.userData.key = key;
+  specs.forEach((sp, i) => {
+    const m = room.userData.meshes[i];
+    m.position.set(sp.c[0], sp.c[1], sp.c[2]);
+    m.scale.set(sp.w, sp.h, 1);
+  });
+}
+
+// ===== ESPEJOS CON REFLEJO EN TIEMPO REAL =====
+// Espejo izquierdo, derecho y retrovisor central. Cada uno tiene una camara que mira hacia atras
+// y dibuja el mundo en una textura pequena (pixelada, igual que el resto del juego).
+// Ajusta aqui: calidad (resolucion de cada espejo) y cada cuantos cuadros se actualiza.
+const MIRRORS = {
+  enabled: true,
+  side:  { w: 112, h: 76, fov: 40, outward: 0.28 },   // resolucion, campo de vision, giro hacia afuera
+  rear:  { w: 224, h: 60, fov: 26 },
+  tint: 0xdde8ee,                                     // tinte del cristal
+  frame: 0x0e0f12,
+};
+let mirrorTick = 0;
+
+function buildCabinMirrors(p, hw, hh){
+  ['mirrorL','mirrorR','rearView'].forEach(n => { if(p[n]) p[n].visible = false; });
+  if(!MIRRORS.enabled) return;
+  let M = carGroup.userData.mirrors;
+  if(!M){
+    M = {};
+    const mk = (key, cfg) => {
+      const rt = new THREE.WebGLRenderTarget(cfg.w, cfg.h, {
+        minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+        format: THREE.RGBAFormat, stencilBuffer: false, depthBuffer: true,
+      });
+      const cam = new THREE.PerspectiveCamera(cfg.fov, cfg.w / cfg.h, 0.1, 400);
+      const glass = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+        new THREE.MeshBasicMaterial({ map: rt.texture, color: MIRRORS.tint, side: THREE.DoubleSide }));
+      const frame = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+        new THREE.MeshBasicMaterial({ color: MIRRORS.frame, side: THREE.DoubleSide }));
+      glass.frustumCulled = false; frame.frustumCulled = false;
+      carGroup.add(frame, glass);
+      M[key] = { rt, cam, glass, frame };
+    };
+    mk('left', MIRRORS.side); mk('right', MIRRORS.side); mk('rear', MIRRORS.rear);
+    const stalk = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ color: MIRRORS.frame, side: THREE.DoubleSide }));
+    stalk.frustumCulled = false; carGroup.add(stalk);
+    M.stalk = stalk;
+    carGroup.userData.mirrors = M;
+  }
+
+  // Espejos laterales (sobre la ventana, delante del cristal).
+  const sw = Math.min(0.36, hw * 0.26), sh = sw * (MIRRORS.side.h / MIRRORS.side.w);
+  [['left', -1], ['right', 1]].forEach(([key, s]) => {
+    const m = M[key];
+    m.glass.position.set(s * 0.88 * hw, 0.10 * hh, -0.95);
+    m.glass.scale.set(-sw, sh, 1);                    // scale.x negativo = efecto espejo
+    m.frame.position.set(s * 0.88 * hw, 0.10 * hh, -0.96);
+    m.frame.scale.set(sw + 0.035, sh + 0.035, 1);
+  });
+
+  // Retrovisor central (arriba del parabrisas).
+  const rw = Math.min(0.60, hw * 0.50), rh = rw * (MIRRORS.rear.h / MIRRORS.rear.w);
+  const ry = 0.50 * hh;
+  M.rear.glass.position.set(0, ry, -0.90);
+  M.rear.glass.scale.set(-rw, rh, 1);
+  M.rear.frame.position.set(0, ry, -0.92);
+  M.rear.frame.scale.set(rw + 0.035, rh + 0.035, 1);
+  const top = 0.90 * hh, base = ry + rh / 2;
+  M.stalk.position.set(0, (top + base) / 2, -0.92);
+  M.stalk.scale.set(0.03, Math.max(0.01, top - base), 1);
+}
+
+function renderCabinMirrors(){
+  const M = carGroup && carGroup.userData.mirrors;
+  if(!M || !MIRRORS.enabled) return;
+  const yaw = carState.yaw;
+  const fx = Math.sin(yaw), fz = Math.cos(yaw);      // hacia adelante
+  const rx = -fz, rz = fx;                            // derecha
+  const gy = carState.y + 1.24;
+  const prev = renderer.getRenderTarget();
+  const draw = (m) => {
+    renderer.setRenderTarget(m.rt);
+    renderer.clear(true, true, true);
+    renderer.render(scene, m.cam);
+  };
+
+  // Retrovisor: mira directo hacia atras.
+  const rc = M.rear.cam;
+  rc.position.set(carState.x + fx * 0.10, gy + 0.08, carState.z + fz * 0.10);
+  rc.lookAt(carState.x - fx * 30, gy - 1.2, carState.z - fz * 30);
+  draw(M.rear);
+
+  // Un espejo lateral por cuadro (se alternan para cuidar el rendimiento).
+  mirrorTick++;
+  const s = (mirrorTick % 2) ? -1 : 1;
+  const m = s < 0 ? M.left : M.right;
+  const o = MIRRORS.side.outward;
+  m.cam.position.set(carState.x + rx * s * 0.95 + fx * 0.25, gy - 0.05, carState.z + rz * s * 0.95 + fz * 0.25);
+  const dx = -fx + rx * s * o, dz = -fz + rz * s * o;
+  const len = Math.hypot(dx, dz) || 1;
+  m.cam.lookAt(m.cam.position.x + dx / len * 30, gy - 1.3, m.cam.position.z + dz / len * 30);
+  draw(m);
+
+  renderer.setRenderTarget(prev);
+}
+
+// ===== CONDUCTOR, VOLANTE Y RELLENOS DEL TABLERO =====
+// - Volante mas alto y cercano para que se vea bien.
+// - Manos sobre el aro (giran con el volante) y brazos con manga que van de los codos a las manos.
+// - Cuerpo del conductor: torso, muslos, piernas y zapatos (se ven al mirar hacia abajo).
+// - Cowl: panel que cierra el hueco entre parabrisas y tablero. Fondo: cierra el hueco de los pies.
+// Ajusta aqui: posicion del volante, colores, codos y hombros.
+const DRIVER = {
+  wheel:  { x:-0.07, y:-0.40, z:-0.78, s:0.56 },
+  skin:0x9c6b48, sleeve:0x1a2431, pants:0x151a20, shoe:0x0b0c0e,
+  cowlColor:0x3b3129, footColor:0x121316,
+  shoulderL:[-0.29,-0.16,0.20], shoulderR:[0.19,-0.16,0.20],
+  elbowL:[-0.38,-0.52,-0.16],   elbowR:[0.28,-0.52,-0.16],
+  hipL:[-0.18,-0.62,0.20],      hipR:[0.08,-0.62,0.20],
+  kneeL:[-0.19,-0.52,-0.32],    kneeR:[0.09,-0.52,-0.32],
+  ankleL:[-0.19,-0.76,-0.48],   ankleR:[0.09,-0.76,-0.48],
+};
+const _limbY = new THREE.Vector3(0, 1, 0);
+function setLimb(m, a, b, t){
+  const d = new THREE.Vector3().subVectors(b, a);
+  const L = d.length() || 0.001;
+  m.position.copy(a).addScaledVector(d, 0.5);
+  m.scale.set(t, L, t);
+  m.quaternion.setFromUnitVectors(_limbY, d.multiplyScalar(1 / L));
+}
+
+function buildCabinDriver(p, hw, hh){
+  const ud = carGroup.userData;
+  // Ocultar el cuerpo, manos y antebrazos viejos.
+  ['leftHand','rightHand','leftForearm','rightForearm'].forEach(n => { if(ud[n]) ud[n].visible = false; });
+  ['torso','neck','head','belt','legL','legR','shoeL','shoeR'].forEach(n => { if(p[n]) p[n].visible = false; });
+
+  const wg = ud.steeringGroup;
+  const V = a => new THREE.Vector3(a[0], a[1], a[2]);
+  let D = ud.driver;
+  if(!D){
+    D = ud.driver = {};
+    const lam = c => new THREE.MeshLambertMaterial({ color:c, flatShading:true });
+    const skin = lam(DRIVER.skin), sleeve = lam(DRIVER.sleeve), pants = lam(DRIVER.pants), shoe = lam(DRIVER.shoe);
+    const unit = m => { const b = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), m); b.frustumCulled = false; carGroup.add(b); return b; };
+
+    // Torso y piernas (fijos).
+    const torso = unit(sleeve); torso.scale.set(0.52, 0.56, 0.26); torso.position.set(-0.05, -0.36, 0.22);
+    const belt = unit(lam(0x14161a)); belt.scale.set(0.54, 0.05, 0.28); belt.position.set(-0.05, -0.62, 0.22);
+    ['L','R'].forEach(k => {
+      setLimb(unit(pants), V(DRIVER['hip'+k]), V(DRIVER['knee'+k]), 0.17);
+      setLimb(unit(pants), V(DRIVER['knee'+k]), V(DRIVER['ankle'+k]), 0.14);
+      const sh = unit(shoe); sh.scale.set(0.16, 0.08, 0.30);
+      sh.position.set(DRIVER['ankle'+k][0], DRIVER['ankle'+k][1] - 0.03, DRIVER['ankle'+k][2] - 0.08);
+    });
+
+    // Brazos (se recalculan cada cuadro) y manos (hijas del volante).
+    ['L','R'].forEach(k => {
+      D['upper'+k] = unit(sleeve);
+      D['fore'+k]  = unit(sleeve);
+      D['wrist'+k] = unit(skin);
+      const side = k === 'L' ? -1 : 1;
+      const g = new THREE.Group();
+      const add = (w, h, d, x, y, z) => { const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), skin); b.position.set(x, y, z); g.add(b); };
+      add(0.11, 0.17, 0.06, 0, 0, 0.09);                                   // dorso de la mano
+      for(let i = 0; i < 4; i++){
+        const y = -0.066 + i * 0.044;
+        add(0.075, 0.038, 0.055, -side * 0.085, y, 0.085);                 // dedos envolviendo el aro
+        add(0.030, 0.038, 0.075, -side * 0.128, y, 0.045);                 // puntas de los dedos por detras
+      }
+      add(0.05, 0.075, 0.04, side * 0.07, 0.07, 0.10);                     // pulgar
+      const anchor = new THREE.Object3D(); anchor.position.set(0, 0, 0.11); g.add(anchor);
+      g.position.set(side * 0.36, 0.02, 0);
+      wg.add(g);
+      D['hand'+k] = g; D['anchor'+k] = anchor;
+    });
+
+    // Rellenos: cowl (entre parabrisas y tablero) y fondo de pies.
+    const plane = (c) => {
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ color:c, side:THREE.DoubleSide }));
+      m.frustumCulled = false; carGroup.add(m); return m;
+    };
+    D.cowl = plane(DRIVER.cowlColor);
+    D.foot = plane(DRIVER.footColor);
+    D.key = '';
+  }
+
+  // Volante alto y cercano (la rotacion por direccion ya la maneja updateCarViewmodel).
+  const W = DRIVER.wheel;
+  wg.position.set(W.x, W.y, W.z);
+  wg.scale.setScalar(W.s);
+
+  // Brazos: del hombro al codo y del codo a la mano (siguen a la mano cuando gira el volante).
+  carGroup.updateMatrixWorld(true);
+  const tmp = new THREE.Vector3();
+  ['L','R'].forEach(k => {
+    D['anchor'+k].getWorldPosition(tmp);
+    carGroup.worldToLocal(tmp);
+    const wrist = tmp.clone(), elbow = V(DRIVER['elbow'+k]), shoulder = V(DRIVER['shoulder'+k]);
+    const dir = wrist.clone().sub(elbow), len = dir.length();
+    dir.normalize();
+    const cuff = elbow.clone().addScaledVector(dir, Math.max(0.05, len - 0.09));
+    setLimb(D['fore'+k],  elbow, cuff, 0.085);
+    setLimb(D['wrist'+k], cuff, wrist, 0.058);
+    setLimb(D['upper'+k], shoulder, elbow, 0.095);
+  });
+
+  // Rellenos (dependen del ancho de pantalla).
+  const key = hw.toFixed(4) + '|' + hh.toFixed(4);
+  if(D.key !== key){
+    D.key = key;
+    D.cowl.position.set(0, -0.305 * hh, -1.05);
+    D.cowl.scale.set(2.10 * hw, 0.31 * hh, 1);
+    D.foot.position.set(0, -0.665 * hh, -1.06);
+    D.foot.scale.set(2.10 * hw, 0.73 * hh, 1);
+  }
+}
+
+// ===== AGUA EN EL PARABRISAS + LUCES DEL TABLERO =====
+// - Gotas de lluvia sobre el parabrisas que crecen y se deslizan hacia abajo dejando huella.
+//   Aparecen segun la lluvia del mundo (weatherState.rain).
+// - Tablero iluminado: cluster con velocimetro y combustible, velocidad digital, intermitentes,
+//   luz de faros y alerta de exceso de velocidad. Brillo sube de noche y con los faros.
+// - Resplandor suave sobre GPS, radio, pantalla de marcha y botones.
+// Ajusta aqui: cantidad de gotas, tamano del cluster y colores de los resplandores.
+const FX = {
+  rain:    { w:160, h:48, maxDrops:70, spawnBase:2, spawnMax:22, widthNdc:1.24 },
+  cluster: { w:192, h:56, x:-0.06, y:-0.28, widthNdc:0.36 },
+  glows: [
+    ['gps',         0x66ffcc, 1.5, 0.30],
+    ['radio',       0x66ccff, 1.5, 0.30],
+    ['gearDisplay', 0xff7744, 1.6, 0.35],
+    ['switchLeft',  0xffaa55, 1.3, 0.20],
+    ['switchRight', 0xffaa55, 1.3, 0.20],
+  ],
+};
+
+function makeGlowTexture(){
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(32, 32, 2, 32, 32, 32);
+  grad.addColorStop(0, 'rgba(255,255,255,1)');
+  grad.addColorStop(0.45, 'rgba(255,255,255,0.35)');
+  grad.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = grad; g.fillRect(0, 0, 64, 64);
+  return new THREE.CanvasTexture(c);
+}
+
+function drawDashCluster(ctx, W, H, t, speed, steer, night, lights){
+  const glow = 0.55 + 0.45 * night;
+  const kmh = Math.abs(speed);
+  const blink = Math.floor(t * 3) % 2 === 0;
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#06080b'; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = '#2b3037'; ctx.lineWidth = 1; ctx.strokeRect(0.5, 0.5, W - 1, H - 1);
+
+  const gauge = (cx, cy, r, p, col) => {
+    ctx.fillStyle = 'rgba(255,190,90,' + (0.10 * glow) + ')';
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+    ctx.globalAlpha = 0.55 + 0.45 * glow;
+    ctx.strokeStyle = col; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(cx, cy, r, Math.PI * 0.75, Math.PI * 2.25); ctx.stroke();
+    ctx.lineWidth = 1;
+    for(let i = 0; i <= 10; i++){
+      const a = Math.PI * 0.75 + (i / 10) * Math.PI * 1.5, r2 = r - (i % 2 ? 3 : 6);
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * (r - 1), cy + Math.sin(a) * (r - 1));
+      ctx.lineTo(cx + Math.cos(a) * r2, cy + Math.sin(a) * r2);
+      ctx.stroke();
+    }
+    const a = Math.PI * 0.75 + Math.max(0, Math.min(1, p)) * Math.PI * 1.5;
+    ctx.strokeStyle = '#ff5a3c'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(cx + Math.cos(a) * (r - 3), cy + Math.sin(a) * (r - 3)); ctx.stroke();
+    ctx.fillStyle = '#ffd9a0'; ctx.fillRect(cx - 1, cy - 1, 3, 3);
+    ctx.globalAlpha = 1;
+  };
+  gauge(42, 27, 22, kmh / 45, '#ffb84d');                         // velocimetro
+  gauge(W - 42, 27, 22, 0.72 + Math.sin(t * 0.3) * 0.02, '#7fe3ff'); // combustible
+
+  // Velocidad digital al centro.
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.font = 'bold 16px monospace';
+  ctx.fillStyle = 'rgba(120,255,200,' + (0.65 + 0.35 * glow) + ')';
+  ctx.fillText(String(Math.round(kmh)), W / 2, 22);
+  ctx.font = '7px monospace';
+  ctx.fillStyle = 'rgba(120,255,200,0.55)';
+  ctx.fillText('km/h', W / 2, 33);
+
+  // Testigos: intermitentes, faros, motor, exceso de velocidad.
+  const tri = (x, y, dir, col) => {
+    ctx.fillStyle = col; ctx.beginPath();
+    ctx.moveTo(x + dir * 4, y); ctx.lineTo(x - dir * 3, y - 4); ctx.lineTo(x - dir * 3, y + 4); ctx.closePath(); ctx.fill();
+  };
+  const y = H - 9;
+  tri(W * 0.36, y, -1, (steer < -0.35 && blink) ? '#3dff6a' : '#0f2a17');
+  tri(W * 0.64, y,  1, (steer >  0.35 && blink) ? '#3dff6a' : '#0f2a17');
+  ctx.fillStyle = lights ? '#4da6ff' : '#0d1a2a'; ctx.fillRect(W * 0.44 - 3, y - 3, 7, 6);
+  ctx.fillStyle = '#5a3d0d'; ctx.fillRect(W * 0.56 - 3, y - 3, 7, 6);
+  ctx.fillStyle = (kmh > 38 && blink) ? '#ff3b30' : '#2a0d0b'; ctx.fillRect(W * 0.50 - 2, y - 2, 5, 5);
+}
+
+function buildCabinFX(p, hw, hh){
+  let F = carGroup.userData.fx;
+  if(!F){
+    F = carGroup.userData.fx = { drops:[], acc:0, last:elapsed, clTime:0, key:'' };
+
+    // Gotas en el parabrisas
+    const rc = document.createElement('canvas'); rc.width = FX.rain.w; rc.height = FX.rain.h;
+    F.rainCtx = rc.getContext('2d');
+    F.rainTex = new THREE.CanvasTexture(rc);
+    F.rainTex.magFilter = THREE.NearestFilter; F.rainTex.minFilter = THREE.NearestFilter;
+    F.rainMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ map:F.rainTex, transparent:true, depthWrite:false, side:THREE.DoubleSide }));
+    F.rainMesh.frustumCulled = false; F.rainMesh.renderOrder = 5;
+    carGroup.add(F.rainMesh);
+
+    // Cluster iluminado
+    const cc = document.createElement('canvas'); cc.width = FX.cluster.w; cc.height = FX.cluster.h;
+    F.clCtx = cc.getContext('2d');
+    F.clTex = new THREE.CanvasTexture(cc);
+    F.clTex.magFilter = THREE.NearestFilter; F.clTex.minFilter = THREE.NearestFilter;
+    F.clMesh = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({ map:F.clTex }));
+    F.clMesh.frustumCulled = false; carGroup.add(F.clMesh);
+
+    // Resplandores (aditivos)
+    const glowTex = makeGlowTexture();
+    const mkGlow = (col) => {
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.MeshBasicMaterial({
+        map:glowTex, color:col, transparent:true, opacity:0.2, depthWrite:false,
+        blending:THREE.AdditiveBlending, side:THREE.DoubleSide }));
+      m.frustumCulled = false; m.renderOrder = 4; carGroup.add(m); return m;
+    };
+    F.clGlow = mkGlow(0xffb060);
+    F.partGlows = FX.glows.map(g => ({ name:g[0], size:g[2], base:g[3], mesh:mkGlow(g[1]) }));
+  }
+
+  const dt = Math.min(0.1, Math.max(0, elapsed - F.last)); F.last = elapsed;
+  let night = (postMat && postMat.uniforms && postMat.uniforms.nightFactor) ? postMat.uniforms.nightFactor.value : 0;
+  /*TESTHOOK_NIGHT*/
+  let rain = weatherState.rain;
+  /*TESTHOOK_RAIN*/
+  const lights = !!headlightsActive;
+  const boost = Math.min(1, night + (lights ? 0.5 : 0));
+
+  // --- Posicion del cluster y resplandores ---
+  const cw = FX.cluster.widthNdc * hw, ch = cw * FX.cluster.h / FX.cluster.w;
+  F.clMesh.position.set(FX.cluster.x * hw, FX.cluster.y * hh, -0.985);
+  F.clMesh.scale.set(cw, ch, 1);
+  F.clGlow.position.set(FX.cluster.x * hw, FX.cluster.y * hh, -0.99);
+  F.clGlow.scale.set(cw * 1.7, ch * 2.4, 1);
+  F.clGlow.material.opacity = 0.10 + 0.40 * boost;
+  F.partGlows.forEach(g => {
+    const part = p[g.name];
+    g.mesh.visible = !!part;
+    if(!part) return;
+    g.mesh.position.set(part.position.x, part.position.y, part.position.z + 0.012);
+    g.mesh.scale.set(Math.max(0.05, part.scale.x) * g.size, Math.max(0.05, part.scale.y) * g.size * 1.2, 1);
+    g.mesh.material.opacity = g.base * (0.35 + 0.65 * boost);
+  });
+
+  // --- Cluster (15 Hz) ---
+  F.clTime += dt;
+  if(F.clTime > 0.066){
+    F.clTime = 0;
+    drawDashCluster(F.clCtx, FX.cluster.w, FX.cluster.h, elapsed, carState.speed, carState.steer, boost, lights);
+    F.clTex.needsUpdate = true;
+  }
+
+  // --- Lluvia en el parabrisas ---
+  const rw = FX.rain.widthNdc * hw, rh = 0.82 * 0.68;
+  F.rainMesh.position.set(0, 0.18 * hh, -1.07);
+  F.rainMesh.scale.set(rw, rh, 1);
+  if(!inCar || vehicleCamMode !== 'first') return;
+
+  const W = FX.rain.w, H = FX.rain.h, D = F.drops;
+  if(rain > 0.08){
+    F.acc += dt * (FX.rain.spawnBase + rain * FX.rain.spawnMax);
+    while(F.acc >= 1 && D.length < FX.rain.maxDrops){
+      F.acc -= 1;
+      D.push({ x:Math.random() * W, y:Math.random() * H * 0.7, r:0.8 + Math.random() * 1.2,
+               wait:0.3 + Math.random() * 2.5, sliding:false, vy:0, sy:0, life:0, ph:Math.random() * 6.28 });
+    }
+    if(F.acc > 3) F.acc = 3;
+  }
+  const spd = Math.min(1, Math.abs(carState.speed) / 45);
+  for(let i = D.length - 1; i >= 0; i--){
+    const d = D[i]; d.life += dt;
+    if(!d.sliding){
+      d.r = Math.min(2.8, d.r + dt * (0.15 + rain * 0.5));
+      d.wait -= dt;
+      if(d.wait <= 0 && d.r > 1.5){ d.sliding = true; d.vy = 5 + Math.random() * 7; d.sy = d.y; }
+      if(rain < 0.05 && d.life > 8) D.splice(i, 1);       // se evaporan al parar la lluvia
+    } else {
+      d.vy += (Math.random() - 0.35) * 14 * dt;             // a veces frena y arranca
+      d.vy = Math.max(2, Math.min(16, d.vy));
+      d.y += d.vy * dt * (1 - spd * 0.5);
+      d.x += Math.sin(d.life * 6 + d.ph) * 2.2 * dt - steerDrift(carState.steer) * dt;
+      d.r = Math.max(1.0, d.r - dt * 0.12);
+      if(Math.random() < dt * 0.35){ d.sliding = false; d.wait = 0.6 + Math.random() * 2; d.sy = Math.min(d.sy, d.y - 2); } // se detiene un rato
+      if(d.y > H + 4) D.splice(i, 1);
+    }
+  }
+  const g = F.rainCtx;
+  g.clearRect(0, 0, W, H);
+  for(const d of D){
+    if(d.sliding || d.y - d.sy > 1){
+      g.fillStyle = 'rgba(190,215,235,0.16)';
+      g.fillRect(Math.round(d.x), Math.round(d.sy), 1, Math.max(1, Math.round(d.y - d.sy)));
+    }
+    const w = Math.max(1, Math.round(d.r)), h = Math.max(1, Math.round(d.r * 1.3));
+    const x = Math.round(d.x - w / 2), y = Math.round(d.y - h / 2);
+    g.fillStyle = 'rgba(30,50,70,0.5)';  g.fillRect(x, y + 1, w, h);
+    g.fillStyle = 'rgba(205,228,245,0.78)'; g.fillRect(x, y, w, h);
+    g.fillStyle = 'rgba(255,255,255,0.95)'; g.fillRect(x, y, 1, 1);
+  }
+  F.rainTex.needsUpdate = true;
+}
+function steerDrift(s){ return (s || 0) * 1.5; }
+
+function setNdcMirror(mesh, x, y, hw, hh){
+  if(!mesh) return;
+  mesh.visible = true;
+  mesh.position.set(x * hw, y * hh, -0.95);
+  mesh.scale.set(0.24, 0.14, 0.03);
+}
+
+// VERSION ACTIVA: aqui se mueven y escalan las piezas que ves en la cabina.
+// VERSION ACTIVA: aqui se ajustan posicion, escala, rotacion y profundidad.
 function layoutCarCabin(){
   if(!carGroup || !carCam) return;
   const d = 1.0;
@@ -1021,6 +1909,8 @@ function layoutCarCabin(){
   const p = carGroup.userData.parts || {};
   const wheelGroup = carGroup.userData.steeringGroup;
 
+  // Coloca una pieza usando coordenadas relativas al centro de la pantalla.
+  // xHs/yHs mueven; sx/sy/sz escalan; rx/ry/rz rotan.
   const setCenter = (mesh, xHs, yHs, sx, sy, sz, rx=0, ry=0, rz=0) => {
     if(!mesh) return;
     const pos = cabPosFromHs(xHs, yHs, d);
@@ -1029,37 +1919,103 @@ function layoutCarCabin(){
     mesh.rotation.set(rx, ry, rz);
   };
 
+  // Coloca una pieza en pantalla: x negativo izquierda, y negativo abajo.
+  // El ultimo valor z controla si queda delante o detras de otra pieza.
   const setNdc = (mesh, x, y, sx, sy, sz, z=-d) => {
     if(!mesh) return;
     mesh.position.set(x * hw, y * hh, z);
     mesh.scale.set(sx, sy, sz);
   };
 
-  setCenter(p.headliner, 0, 0.34, 1.46, 0.22, 0.03);
-  setCenter(p.panelTop, 0, 0.39, 1.08, 0.10, 0.05);
-  setCenter(p.dash, 0, -0.08, 1.15, 0.48, 0.05, -0.08, 0, 0);
-  setCenter(p.console, 0.16, -0.35, 0.26, 0.18, 0.04);
-  setCenter(p.screen, 0.18, -0.10, 0.18, 0.08, 0.04);
-  setCenter(p.cluster, -0.12, -0.14, 0.38, 0.16, 0.04);
-  setCenter(p.rearView, 0.25, 0.09, 0.18, 0.08, 0.04);
-  setCenter(p.wheelGroup, -0.12, -0.28, 0.44, 0.44, 0.44, -0.35, 0, 0);
-  if(p.floor) { p.floor.position.set(0, -0.72, 0.18); p.floor.rotation.x = 0; }
-  if(p.dashPanel) { p.dashPanel.position.set(0, -0.12, 0.18); }
-  if(p.roof) { p.roof.position.set(0, 0.46, 0.08); p.roof.rotation.x = 0; }
-  if(p.seatL) { p.seatL.position.set(-0.32, -0.54, 0.28); p.seatL.rotation.y = 0.12; }
-  if(p.seatR) { p.seatR.position.set(0.32, -0.54, 0.28); p.seatR.rotation.y = -0.12; }
-  if(p.doorTrimL) { p.doorTrimL.position.set(-0.78, -0.18, 0.18); }
-  if(p.doorTrimR) { p.doorTrimR.position.set(0.78, -0.18, 0.18); }
+  // Composicion nueva: techo arriba, tablero abajo y volante centrado.
+  setCenter(p.headliner, 0, 0.40, 1.48, 0.18, 0.03);
+  setCenter(p.panelTop, 0, 0.34, 1.14, 0.08, 0.04);
+  setCenter(p.dash, 0, -0.27, 1.20, 0.34, 0.05, -0.04, 0, 0);
+  setCenter(p.console, 0.16, -0.38, 0.24, 0.16, 0.04);
+  setCenter(p.screen, 0.42, -0.28, 0.16, 0.07, 0.04);
+  setCenter(p.cluster, -0.18, -0.28, 0.48, 0.42, 0.04);
+  setCenter(p.rearView, 0, 0.27, 0.22, 0.09, 0.04);
+  setCenter(p.wheelGroup, -0.12, -0.43, 0.52, 0.52, 0.52, -0.35, 0, clamp(carState.steer, -1, 1) * -1.3);
+  setCenter(p.gps, -0.42, -0.28, 0.28, 0.22, 0.035);
+  setCenter(p.switchLeft, -0.42, -0.48, 0.28, 0.20, 0.035);
+  setCenter(p.radio, 0.40, -0.29, 0.30, 0.24, 0.04);
+  setCenter(p.gearDisplay, 0.40, -0.46, 0.25, 0.12, 0.025);
+  setCenter(p.switchRight, 0.40, -0.62, 0.28, 0.18, 0.035);
+  setCenter(p.gearLever, 0.10, -0.56, 0.18, 0.14, 0.03);
+  if(p.floor) { p.floor.position.set(0, -0.78, -0.56); p.floor.rotation.x = 0; p.floor.scale.set(1.25, 1, 1.05); }
+  if(p.dashPanel) { p.dashPanel.position.set(0, -0.52, -0.72); p.dashPanel.scale.set(0.86, 0.58, 1); }
+  if(p.roof) { p.roof.position.set(0, 0.58, -0.78); p.roof.rotation.x = 0; p.roof.scale.set(1.06, 1, 1); }
+  if(p.seatL) { p.seatL.position.set(-0.32, -0.54, 0.82); p.seatL.rotation.y = 0.12; }
+  if(p.seatR) { p.seatR.position.set(0.32, -0.54, 0.82); p.seatR.rotation.y = -0.12; }
+  if(p.doorTrimL) { p.doorTrimL.position.set(-0.79, -0.18, -0.84); p.doorTrimL.scale.set(1.7, 1.16, 1); }
+  if(p.doorTrimR) { p.doorTrimR.position.set(0.79, -0.18, -0.84); p.doorTrimR.scale.set(1.7, 1.16, 1); }
 
-  setNdc(p.pillarL, -0.45, 0.18, 0.14, 0.72, 0.03);
-  setNdc(p.pillarR, 0.45, 0.18, 0.14, 0.72, 0.03);
-  setNdc(p.mirrorL, -0.84, -0.22, 0.22, 0.12, 0.03);
-  setNdc(p.mirrorR, 0.90, -0.15, 0.18, 0.10, 0.03);
-  setNdc(p.doorL, -0.74, -0.20, 0.38, 0.46, 0.03);
-  setNdc(p.doorR, 0.74, -0.16, 0.38, 0.46, 0.03);
-  setNdc(p.doorL2, -0.70, -0.12, 0.36, 0.20, 0.03);
-  setNdc(p.doorR2, 0.70, -0.10, 0.36, 0.20, 0.03);
+  setNdc(p.windshield, 0, 0.18, 1.08, 0.68, 0.02, -1.08);
+  setNdc(p.windshieldTint, 0, 0.18, 1.04, 0.64, 0.02, -1.09);
+  setNdc(p.windshieldTop, 0, 0.54, 1.10, 0.11, 0.04, -1.11);
+  setNdc(p.windshieldBottom, 0, -0.18, 1.10, 0.08, 0.04, -1.11);
+  setNdc(p.wiperL, -0.24, 0.05, 0.16, 0.40, 0.04, -1.12);
+  setNdc(p.wiperR, 0.24, 0.05, 0.16, 0.40, 0.04, -1.12);
+  setNdc(p.pedals, 0.10, -0.70, 0.30, 0.20, 0.05, -0.62);
 
+  // Puertas, marcos laterales y espejos.
+  setNdc(p.pillarL, -0.82, 0.20, 0.20, 0.82, 0.04, -1.10);
+  setNdc(p.pillarR, 0.82, 0.20, 0.20, 0.82, 0.04, -1.10);
+  setNdc(p.mirrorL, -0.88, -0.12, 0.24, 0.14, 0.03, -1.06);
+  setNdc(p.mirrorR, 0.88, -0.12, 0.24, 0.14, 0.03, -1.06);
+  setNdc(p.doorL, -0.86, -0.40, 0.54, 0.58, 0.06, -0.94);
+  setNdc(p.doorR, 0.86, -0.40, 0.54, 0.58, 0.06, -0.94);
+  setNdc(p.doorL2, -0.84, -0.18, 0.48, 0.22, 0.06, -0.96);
+  setNdc(p.doorR2, 0.84, -0.18, 0.48, 0.22, 0.06, -0.96);
+  setNdc(p.doorHandleL, -0.82, -0.38, 0.90, 0.90, 0.08, -0.99);
+  setNdc(p.doorHandleR, 0.82, -0.38, 0.90, 0.90, 0.08, -0.99);
+  setNdc(p.armrestL, -0.82, -0.53, 0.88, 0.76, 0.08, -0.98);
+  setNdc(p.armrestR, 0.82, -0.53, 0.88, 0.76, 0.08, -0.98);
+  setNdc(p.sidePanelL, -0.91, -0.38, 0.90, 1.10, 0.12, -1.02);
+  setNdc(p.sidePanelR, 0.91, -0.38, 0.90, 1.10, 0.12, -1.02);
+  setNdc(p.sideFrameL, -0.76, 0.22, 0.92, 1.20, 0.10, -1.13);
+  setNdc(p.sideFrameR, 0.76, 0.22, 0.92, 1.20, 0.10, -1.13);
+  p.sideFrameL.rotation.z = -0.12;
+  p.sideFrameR.rotation.z = 0.12;
+  // Pilar A: ancho, inclinado y pegado a los bordes del parabrisas.
+  setNdc(p.pillarL, -0.76, 0.20, 0.92, 1.20, 0.10, -1.13);
+  setNdc(p.pillarR, 0.76, 0.20, 0.92, 1.20, 0.10, -1.13);
+  p.pillarL.rotation.z = -0.12;
+  p.pillarR.rotation.z = 0.12;
+  // Pilar B, marco superior y ventana lateral transparente.
+  setNdc(p.pillarBL, -0.94, 0.00, 0.90, 0.92, 0.08, -1.08);
+  setNdc(p.pillarBR, 0.94, 0.00, 0.90, 0.92, 0.08, -1.08);
+  setNdc(p.roofRailL, -0.85, 0.55, 0.90, 0.82, 0.08, -1.10);
+  setNdc(p.roofRailR, 0.85, 0.55, 0.90, 0.82, 0.08, -1.10);
+  setNdc(p.sideWindowL, -0.85, 0.02, 0.92, 0.58, 0.06, -1.04);
+  setNdc(p.sideWindowR, 0.85, 0.02, 0.92, 0.58, 0.06, -1.04);
+  setNdc(p.windowButtonL, -0.82, -0.49, 0.90, 0.90, 0.08, -1.00);
+  setNdc(p.windowButtonR, 0.82, -0.49, 0.90, 0.90, 0.08, -1.00);
+  setNdc(p.floorSideL, -0.58, -0.76, 0.92, 1.00, 0.90, -0.62);
+  setNdc(p.floorSideR, 0.58, -0.76, 0.92, 1.00, 0.90, -0.62);
+
+  // Tablero bajo y envolvente, con visera limpia sobre los relojes.
+  setCenter(p.dashWingL, -0.39, -0.27, 0.64, 0.82, 0.05, 0, 0, -0.08);
+  setCenter(p.dashWingR, 0.39, -0.27, 0.64, 0.82, 0.05, 0, 0, 0.08);
+  setCenter(p.clusterVisor, -0.18, -0.08, 0.64, 0.72, 0.05, -0.08, 0, 0);
+
+  setCenter(p.ventL, -0.25, -0.18, 0.24, 0.10, 0.04);
+  setCenter(p.ventR, 0.22, -0.18, 0.24, 0.10, 0.04);
+
+  // Cuerpo bajo el volante: se mantiene delante del asiento y detras de las manos.
+  setNdc(p.torso, 0.05, -0.79, 0.62, 0.52, 0.14, -0.50);
+  setNdc(p.neck, 0.05, -0.60, 0.44, 0.42, 0.12, 0.52);
+  setNdc(p.head, 0.05, -0.42, 0.44, 0.48, 0.16, 0.62);
+  setNdc(p.belt, 0.05, -0.72, 0.66, 0.10, 0.08, -0.54);
+  setNdc(p.legL, -0.14, -0.91, 0.45, 0.62, 0.16, -0.48);
+  setNdc(p.legR, 0.18, -0.91, 0.45, 0.62, 0.16, -0.48);
+  setNdc(p.shoeL, -0.14, -0.99, 0.52, 0.28, 0.20, -0.58);
+  setNdc(p.shoeR, 0.18, -0.99, 0.52, 0.28, 0.20, -0.58);
+
+  // Cascaron lateral: puertas, ventanas, pilares y techo que cierran los costados.
+  buildCabinSideShell(p, hw, hh);
+
+  // Luces superiores, manos y brazos.
   if(p.leftPod) p.leftPod.position.set(-0.31, -0.10, -0.04);
   if(p.rightPod) p.rightPod.position.set(0.54, 0.07, -0.04);
   if(p.leftPod2) p.leftPod2.position.set(-0.42, -0.28, -0.05);
@@ -1069,17 +2025,22 @@ function layoutCarCabin(){
   if(p.leftPod2) p.leftPod2.rotation.z = 0.08;
   if(p.rightPod2) p.rightPod2.rotation.z = -0.08;
 
-  if(carGroup.userData.leftHand) carGroup.userData.leftHand.position.set(-0.34, -0.18, -0.07);
-  if(carGroup.userData.rightHand) carGroup.userData.rightHand.position.set(0.08, -0.18, -0.07);
-  if(carGroup.userData.leftForearm) carGroup.userData.leftForearm.position.set(-0.48, -0.42, -0.06);
-  if(carGroup.userData.rightForearm) carGroup.userData.rightForearm.position.set(0.25, -0.42, -0.06);
-  if(carGroup.userData.leftForearm) carGroup.userData.leftForearm.rotation.z = -0.8;
-  if(carGroup.userData.rightForearm) carGroup.userData.rightForearm.rotation.z = 0.7;
+  if(carGroup.userData.leftHand) carGroup.userData.leftHand.position.set(-0.24, 0.10, -0.02);
+  if(carGroup.userData.rightHand) carGroup.userData.rightHand.position.set(0.24, 0.10, -0.02);
+  if(carGroup.userData.leftForearm) carGroup.userData.leftForearm.position.set(-0.39, -0.28, -0.02);
+  if(carGroup.userData.rightForearm) carGroup.userData.rightForearm.position.set(0.39, -0.28, -0.02);
+  if(carGroup.userData.leftForearm) carGroup.userData.leftForearm.rotation.z = -0.45 + clamp(carState.steer, -1, 1) * 0.12;
+  if(carGroup.userData.rightForearm) carGroup.userData.rightForearm.rotation.z = 0.45 - clamp(carState.steer, -1, 1) * 0.12;
 
   if(wheelGroup){
-    wheelGroup.rotation.z = 0;
     wheelGroup.rotation.x = -0.35;
   }
+
+  // Conductor, volante y rellenos del tablero.
+  buildCabinDriver(p, hw, hh);
+
+  // Agua en el parabrisas y luces del tablero.
+  buildCabinFX(p, hw, hh);
 }
 
 /* ══════════════════════════════════════════════════════════════
@@ -1187,6 +2148,28 @@ function buildCarModel(){
     mirror.position.set(side * 0.92, 1.4, 0.7);
     g.add(mirror);
   }
+
+  // Puertas exteriores con bisagra para la animacion de entrada y salida.
+  const exteriorDoors = [];
+  for(const side of [-1, 1]){
+    const hinge = new THREE.Group();
+    hinge.position.set(side * 0.82, 1.18, -0.20);
+    const panel = new THREE.Mesh(
+      new THREE.BoxGeometry(0.08, 0.72, 1.38),
+      new THREE.MeshLambertMaterial({ color: BODY, flatShading: true })
+    );
+    panel.position.x = side * 0.07;
+    hinge.add(panel);
+    const window = new THREE.Mesh(
+      new THREE.BoxGeometry(0.085, 0.28, 1.05),
+      new THREE.MeshLambertMaterial({ color: GLASS, transparent: true, opacity: 0.78, flatShading: true })
+    );
+    window.position.set(side * 0.075, 0.18, 0);
+    hinge.add(window);
+    g.add(hinge);
+    exteriorDoors.push({ hinge, side });
+  }
+  g.userData.exteriorDoors = exteriorDoors;
 
   const rearDeck = new THREE.Mesh(
     new THREE.BoxGeometry(1.7, 0.2, 1.45),
@@ -2663,7 +3646,8 @@ function createTornadoField(parent, cx, cz, radius){
     const impactLight = new THREE.PointLight(0x9fe8ff, 0, 720, 2);
     g.add(impactLight);
     const debrisList = [];
-    for(let d = 0; d < 42; d++){
+    const debrisCount = isMobile ? 42 : 30;
+    for(let d = 0; d < debrisCount; d++){
       const debrisY = -totalHeight * 0.42 + Math.random() * totalHeight * 0.84;
       const heightRatio = debrisY / totalHeight + 0.5;
       const r = 8 + heightRatio * coneRadius * 1.05 + Math.random() * 18;
@@ -2680,7 +3664,7 @@ function createTornadoField(parent, cx, cz, radius){
       g.add(frag);
       debrisList.push({ mesh: frag, ang, r, y: debrisY, lift: 0.08 + Math.random() * 0.12, orbitSpeed: 2.4 + Math.random() * 2.2, phase: Math.random() * Math.PI * 2, spin: (Math.random() - 0.5) * 6 });
     }
-    const particleCount = isMobile ? 850 : 1800;
+    const particleCount = isMobile ? 850 : 1100;
     const particlePositions = new Float32Array(particleCount * 3);
     const particleColors = new Float32Array(particleCount * 3);
     const particlePhases = new Float32Array(particleCount);
@@ -2711,7 +3695,7 @@ function createTornadoField(parent, cx, cz, radius){
     whitePoints.frustumCulled = false;
     g.add(whitePoints);
 
-    const tinyTreeCount = isMobile ? 20 : 48;
+    const tinyTreeCount = isMobile ? 20 : 28;
     const tinyTrunks = new THREE.InstancedMesh(
       new THREE.CylinderGeometry(0.45, 0.7, 8, 4),
       new THREE.MeshLambertMaterial({ color: 0x554536 }),
@@ -2936,11 +3920,26 @@ function createAtmosphere(parent, rng){
 }
 
 function buildHouse(cx,cz,baseY,rotY){
-  const WALL=0xc8b898, ROOF=0x8a3020, WOOD=0x4a3520;
+  const WALL=0xc8b898, ROOF=0x8a3020, WOOD=0x4a3520, FLOOR=0x5a4634, MIRROR=0x7fc8d8;
+  const local = (lx,lz) => ({
+    x: cx + lx * Math.cos(rotY) - lz * Math.sin(rotY),
+    z: cz + lx * Math.sin(rotY) + lz * Math.cos(rotY),
+  });
   addSolidBox(cx, baseY+3, cz, 9, 6, 8, WALL, rotY);
+  addBox(cx, baseY+0.18, cz, 9.3, 0.36, 8.3, FLOOR, rotY);
   addBox(cx, baseY+7.5, cz, 10, 3, 9, ROOF, rotY);
   addBox(cx, baseY+9.5, cz, 7, 2, 6, ROOF, rotY);
-  addBox(cx, baseY+2, cz+4.2, 2, 4, 0.5, WOOD, rotY);
+  const front = local(0, 4.2);
+  const leftFrame = local(-1.15, 4.16);
+  const rightFrame = local(1.15, 4.16);
+  const lintel = local(0, 4.16);
+  addBox(front.x, baseY+2, front.z, 1.8, 4, 0.5, WOOD, rotY);
+  addBox(leftFrame.x, baseY+2, leftFrame.z, 0.18, 4.5, 0.62, WOOD, rotY);
+  addBox(rightFrame.x, baseY+2, rightFrame.z, 0.18, 4.5, 0.62, WOOD, rotY);
+  addBox(lintel.x, baseY+4.25, lintel.z, 2.45, 0.18, 0.62, WOOD, rotY);
+  const mirror = local(-2.8, 4.08);
+  addBox(mirror.x, baseY+3.15, mirror.z, 1.25, 1.55, 0.12, MIRROR, rotY);
+  addBox(mirror.x, baseY+3.15, mirror.z - 0.08, 1.48, 1.78, 0.06, WOOD, rotY);
 }
 function buildBridge(cx,cz,baseY,len,dir){
   const W=0x6a4a30, W_D=0x4a3520;
@@ -3164,9 +4163,9 @@ function buildDenseForest(parent, centerX, centerZ, radius, rng){
 }
 
 function buildWindyGroundcover(parent, rng, noise, groundAt){
-  const bladeCount = isMobile ? 4000 : 8000;
-  const shrubCount = isMobile ? 1000 : 2200;
-  const flowerCount = isMobile ? 400 : 1000;
+  const bladeCount = isMobile ? 4000 : 5000;
+  const shrubCount = isMobile ? 1000 : 1300;
+  const flowerCount = isMobile ? 400 : 650;
   const bladeGeometry = new THREE.ConeGeometry(0.52, 4.4, 4);
   bladeGeometry.translate(0, 2.2, 0);
   const blades = new THREE.InstancedMesh(bladeGeometry, new THREE.MeshLambertMaterial({ color: 0xffffff }), bladeCount);
@@ -3883,7 +4882,7 @@ function createWorld(seed){
   const sun = new THREE.DirectionalLight(0xffe8c0, 0.82);
   sun.position.set(SUN_NX*300, SUN_NY*300, SUN_NZ*300);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(isMobile ? 1024 : 1536, isMobile ? 1024 : 1536);
+  sun.shadow.mapSize.set(1024, 1024);
   sun.shadow.camera.left = -380;
   sun.shadow.camera.right = 380;
   sun.shadow.camera.top = 380;
@@ -3898,7 +4897,7 @@ function createWorld(seed){
 
   const stormLight = new THREE.DirectionalLight(0x4a5d7a, 0.72);
   stormLight.position.set(-180, 120, 220);
-  stormLight.castShadow = true;
+  stormLight.castShadow = !isMobile;
   stormLight.shadow.mapSize.set(1024, 1024);
   stormLight.shadow.camera.left = -180;
   stormLight.shadow.camera.right = 180;
@@ -4671,13 +5670,39 @@ function updateBossBar(){
 function applyCarExteriorVisibilityForCamera(){
   if(!carMesh) return;
   const hide = inCar && vehicleCamMode === 'first';
-  carMesh.traverse(obj => {
-    if(obj.isMesh) obj.visible = !hide;
-  });
+  carMesh.visible = !hide;
+}
+
+function updateCarDoorAnimation(dt){
+  if(!carMesh || !carMesh.userData.exteriorDoors) return;
+  if(carDoorAnim.timer > 0){
+    carDoorAnim.timer -= dt;
+    if(carDoorAnim.timer <= 0) carDoorAnim.target = 0;
+  }
+  carDoorAnim.progress += (carDoorAnim.target - carDoorAnim.progress) * Math.min(1, dt * 7);
+  const openAngle = 1.05;
+  for(const door of carMesh.userData.exteriorDoors){
+    door.hinge.rotation.y = door.side * openAngle * carDoorAnim.progress;
+  }
+  if(carDoorAnim.progress < 0.05 && carDoorAnim.target === 0){
+    applyCarExteriorVisibilityForCamera();
+  }
+}
+
+function startCarDoorAnimation(){
+  carDoorAnim.progress = Math.max(carDoorAnim.progress, 0.05);
+  carDoorAnim.target = 1;
+  carDoorAnim.timer = 0.65;
 }
 
 function toggleVehicleCamMode(){
   if(!inCar){
+    if(!inShip){
+      playerCamMode = 'first';
+      if(playerAvatar) playerAvatar.visible = false;
+      showToast('🎥 Cámara jugador 1ª persona');
+      return;
+    }
     showToast('🚗 Entra al auto para cambiar la cámara');
     return;
   }
@@ -4697,6 +5722,7 @@ function toggleShip(){
   atkBtn.classList.toggle('ship-mode', inShip);
   atkBtn.textContent = inShip ? 'FIRE' : 'ATK';
   if(inShip){
+    if(playerAvatar) playerAvatar.visible = false;
     shipState.x = playerState.x; shipState.z = playerState.z; shipState.y = playerState.y + 18;
     shipState.yaw = camState.yaw; shipState.pitch = 0; shipState.roll = 0;
     shipState.velX = 0; shipState.velY = 0; shipState.velZ = 0; shipState.speed = 0;
@@ -4733,6 +5759,9 @@ function toggleCar(forceExit){
   shipBtn.classList.remove('ship-on');
   atkBtn.textContent = 'ATK';
   if(inCar){
+    // La cabina interior siempre entra en primera persona.
+    vehicleCamMode = 'first';
+    if(playerAvatar) playerAvatar.visible = false;
     headlightsActive = false;
     if(altBtn) altBtn.textContent = 'LUZ OFF';
     const fx = Math.sin(camState.yaw);
@@ -4745,10 +5774,13 @@ function toggleCar(forceExit){
     carState.y = currentWorld.groundAt(sx, sz) + 0.5;
     carState.yaw = camState.yaw;
     carState.pitch = 0; carState.roll = 0;
+    carLookYaw = 0;
+    carLookPitch = 0;
     carState.speed = 0; carState.velX = 0; carState.velZ = 0; carState.steer = 0;
     carMesh.visible = true;
     carMesh.position.set(carState.x, carState.y, carState.z);
     carMesh.rotation.y = carState.yaw;
+    startCarDoorAnimation();
     applyCarExteriorVisibilityForCamera();
     showToast('🚗 Auto invocado — ' + (vehicleCamMode === 'third' ? '3ª persona' : '1ª persona'));
   } else {
@@ -4761,8 +5793,9 @@ function toggleCar(forceExit){
     playerState.smoothY = currentWorld.groundAt(playerState.x, playerState.z);
     camState.yaw = carState.yaw;
     camState.pitch = 0;
-    carMesh.visible = false;
+    carMesh.visible = true;
     carMesh.traverse(obj => { if(obj.isMesh) obj.visible = true; });
+    startCarDoorAnimation();
     showToast('🚶 Has bajado del auto');
   }
 }
@@ -4811,7 +5844,8 @@ function setupInput(){
       shipState.yaw -= dx*0.006;
       shipState.pitch = clamp(shipState.pitch - dy*0.005, -1.2, 1.2);
     } else if(inCar){
-      carState.yaw -= dx*0.006;
+      carLookYaw = clamp(carLookYaw - dx*0.006, -1.05, 1.05);
+      carLookPitch = clamp(carLookPitch - dy*0.005, -0.42, 0.34);
     } else {
       camState.yaw -= dx*0.006;
       camState.pitch = clamp(camState.pitch - dy*0.005, -0.9, 0.9);
@@ -4921,7 +5955,7 @@ function updateCar(dt){
     if(Math.abs(stepH - curH) > 5) blocked = true;
     if(!blocked && Math.abs(carState.speed) > 3){
       for(const plant of currentWorld.group.userData.windPlants || []){
-        if(plant.falling || plant.fallen) continue;
+          if(plant.falling || plant.fallen || !plant.root.visible) continue;
         if(Math.hypot(nx - plant.x, nz - plant.z) < plant.radius + 2.4){
           struckTree = plant;
           blocked = true;
@@ -5290,7 +6324,14 @@ function updateJoystickLook(dt){
   joySmoothX += (joyNX - joySmoothX) * Math.min(1, dt*16);
   joySmoothY += (joyNY - joySmoothY) * Math.min(1, dt*16);
   if(inShip) return;
-  if(inCar) return;
+  if(inCar){
+    const mag = Math.hypot(joySmoothX, joySmoothY);
+    if(mag < 0.08) return;
+    const k = (mag-0.08)/(1-0.08);
+    carLookYaw = clamp(carLookYaw - (joySmoothX/mag) * k * 2.6 * dt, -1.05, 1.05);
+    carLookPitch = clamp(carLookPitch - (joySmoothY/mag) * k * 1.8 * dt, -0.42, 0.34);
+    return;
+  }
   const mag = Math.hypot(joySmoothX, joySmoothY);
   if(mag < 0.08) return;
   const k = (mag-0.08)/(1-0.08);
@@ -5483,7 +6524,7 @@ function updateAtmosphere(dt){
   const groundcover = currentWorld.group.userData.groundcover;
   if(groundcover){
     groundcover.timer += dt;
-    if(groundcover.timer > 0.08){
+    if(groundcover.timer > (isMobile ? 0.08 : 0.2)){
       groundcover.timer = 0;
       const dummy = new THREE.Object3D();
       const tornado = currentWorld.group.userData.tornadoes[0];
@@ -6034,7 +7075,8 @@ function updateCamera(dt){
 
   // ═══ AUTO ═══
   if(inCar){
-    const cy = Math.cos(carState.yaw), sy = Math.sin(carState.yaw);
+    const viewYaw = carState.yaw + carLookYaw;
+    const cy = Math.cos(viewYaw), sy = Math.sin(viewYaw);
     const fx = sy;
     const fz = cy;
     const speedK = clamp(Math.abs(carState.speed)/45, 0, 1);
@@ -6044,16 +7086,16 @@ function updateCamera(dt){
       const seatY = carState.y + 1.24;
       const seatZ = carState.z + fz * 0.22;
       const lookX = carState.x + fx * 18;
-      const lookY = carState.y + 0.65 + Math.sin(-carState.pitch) * 2.0;
+      const lookY = carState.y + 0.65 + Math.sin(-carLookPitch) * 2.0;
       const lookZ = carState.z + fz * 18;
       camera.position.set(seatX, seatY, seatZ);
       camera.up.set(0,1,0);
       camera.lookAt(lookX, lookY, lookZ);
-      camera.rotation.z += carState.roll * 0.08 + carState.steer * 0.008;
+      camera.rotation.z += -carState.roll * 0.08 + carState.steer * 0.008;
 
-      carCam.position.set(0, 0.05, 0.15);
-      carCam.up.set(0,1,0);
-      carCam.lookAt(0, 0.08, -4.0);
+      carCam.position.set(0, 0.05, 0.02);
+      carCam.rotation.order = 'YXZ';
+      carCam.rotation.set(carLookPitch, carLookYaw, -carState.roll * 0.02);
     } else {
       const dist = carState.camDist + speedK * 3;
       const height = carState.camHeight + speedK * 0.6;
@@ -6065,7 +7107,7 @@ function updateCamera(dt){
       camera.position.z += (tz - camera.position.z) * Math.min(1, dt*8);
       camera.up.set(0,1,0);
       camera.lookAt(carState.x + fx*6, carState.y + 1.3, carState.z + fz*6);
-      carCam.position.set(0, 0.05, 0.15);
+      carCam.position.set(0, 0.05, 0.02);
       carCam.up.set(0,1,0);
       carCam.lookAt(0, 0.1, -4.0);
     }
@@ -6074,6 +7116,28 @@ function updateCamera(dt){
   }
 
   // ═══ A PIE ═══
+  if(playerAvatar){
+    playerAvatar.visible = playerCamMode === 'third';
+    playerAvatar.position.set(playerState.x, playerState.y, playerState.z);
+    playerAvatar.rotation.y = playerState.facing;
+    const walking = bobAmt > 0.25;
+    playerAvatar.userData.walkPhase += dt * (walking ? 10 : 2);
+    const stride = walking ? Math.sin(playerAvatar.userData.walkPhase) * 0.35 : 0;
+    if(playerAvatar.userData.legs){
+      playerAvatar.userData.legs[0].rotation.x = stride;
+      playerAvatar.userData.legs[1].rotation.x = -stride;
+    }
+  }
+  if(playerCamMode === 'third'){
+    const backX = Math.sin(camState.yaw) * 4.6;
+    const backZ = Math.cos(camState.yaw) * 4.6;
+    const targetY = playerState.y + 1.15;
+    camera.position.set(playerState.x + backX, playerState.y + 2.55, playerState.z + backZ);
+    camera.up.set(0,1,0);
+    camera.lookAt(playerState.x, targetY, playerState.z);
+    if(currentWorld.sky) currentWorld.sky.position.copy(camera.position);
+    return;
+  }
   const dYaw   = camState.yaw - camState.prevYaw;
   const dPitch = camState.pitch - camState.prevPitch;
   camState.swayX = camState.swayX*0.80 - dYaw*1.2;
@@ -6144,6 +7208,7 @@ function updateShipViewmodel(dt){
 
 function updateCarViewmodel(dt){
   if(!carGroup) return;
+  carGroup.visible = true;
   const wheelGroup = carGroup.userData.steeringGroup;
   const leftDial = carGroup.userData.leftDial;
   const rightDial = carGroup.userData.rightDial;
@@ -6154,7 +7219,7 @@ function updateCarViewmodel(dt){
 
   const steer = clamp(carState.steer, -1, 1);
   if(wheelGroup){
-    wheelGroup.rotation.z = steer * 1.3;
+    wheelGroup.rotation.z = -steer * 1.3;   // derecha = giro horario
     wheelGroup.rotation.x = -0.35;
   }
 
@@ -6170,10 +7235,16 @@ function updateCarViewmodel(dt){
 
   const vib = clamp(speed / 45, 0, 1) * 0.004;
   carGroup.position.y = Math.sin(elapsed * 8) * vib;
-  carGroup.rotation.z = carState.roll * 0.5;
+  carGroup.rotation.z = -carState.roll * 0.5;
 
-  if(leftHand){ leftHand.position.y = -0.18 + Math.sin(elapsed * 16) * 0.002; }
-  if(rightHand){ rightHand.position.y = -0.18 + Math.cos(elapsed * 16 + 0.5) * 0.002; }
+  if(leftHand){
+    leftHand.position.set(-0.24, 0.10 + Math.sin(elapsed * 16) * 0.002, -0.02);
+    leftHand.rotation.z = -0.18 + steer * 0.08;
+  }
+  if(rightHand){
+    rightHand.position.set(0.24, 0.10 + Math.cos(elapsed * 16 + 0.5) * 0.002, -0.02);
+    rightHand.rotation.z = 0.18 - steer * 0.08;
+  }
   if(leftForearm){ leftForearm.rotation.z = -0.8 + steer * 0.25; }
   if(rightForearm){ rightForearm.rotation.z = 0.7 - steer * 0.25; }
 
@@ -6285,6 +7356,9 @@ function showDeathScreen(){
    ══════════════════════════════════════════════════════════════ */
 const splashEl = document.getElementById('splash');
 let playing = false;
+// Modo edicion: inicia directamente para poder recargar y revisar cambios sin pulsar Comenzar.
+// Ponlo en false para volver a mostrar la pantalla inicial.
+const EDIT_MODE = true;
 
 function startGame(){
   initAudio();
@@ -6297,6 +7371,11 @@ function startGame(){
   requestAnimationFrame(()=>{
     resize();
     loadWorld();
+    // En modo edicion empezamos dentro del auto y con la vista del conductor.
+    if(EDIT_MODE){
+      vehicleCamMode = 'first';
+      toggleCar(false);
+    }
     splashEl.classList.add('hide');
     playing = true;
     updateHpBar();
@@ -6365,6 +7444,7 @@ function loop(t){
   updateCamera(dt);
   updateShipViewmodel(dt);
   updateCarViewmodel(dt);
+  updateCarDoorAnimation(dt);
   updateWater(elapsed);
   updateBossBar();
   postMat.uniforms.time.value = elapsed;
@@ -6372,13 +7452,14 @@ function loop(t){
   minimapAcc += dt;
   if(minimapAcc > 0.1){ updateMinimap(); minimapAcc = 0; }
 
+  if(inCar && vehicleCamMode === 'first') renderCabinMirrors();
   renderer.setRenderTarget(renderTarget);
   renderer.clear(true,true,true);
   renderer.render(scene, camera);
   renderer.clearDepth();
   if(inShip){ renderer.render(shipScene, shipCam); }
   else if(inCar && vehicleCamMode === 'first'){ renderer.render(carScene, carCam); }
-  else if(!inCar){ renderer.render(vmScene, vmCam); }
+  else if(!inCar && playerCamMode === 'first'){ renderer.render(vmScene, vmCam); }
   renderer.setRenderTarget(null);
   postMat.uniforms.tDiffuse.value = renderTarget.texture;
   renderer.render(postScene, postCam);
@@ -6402,13 +7483,15 @@ document.getElementById('btn-flashlight').addEventListener('click', toggleFlashl
 document.getElementById('pause-continue').addEventListener('click', ()=>togglePause());
 document.getElementById('pause-mute').addEventListener('click', toggleMute);
 document.getElementById('pause-quality').addEventListener('click', ()=>{
-  lowResDynamic = lowResDynamic <= BASE_RESOLUTION_SCALE ? (isMobile ? 3 : 6) : (isMobile ? 1.5 : 4);
+  lowResDynamic = lowResDynamic <= BASE_RESOLUTION_SCALE ? (isMobile ? 3 : 4) : BASE_RESOLUTION_SCALE;
   resize();
   showToast(lowResDynamic <= BASE_RESOLUTION_SCALE ? 'Calidad: alta' : 'Calidad: baja');
 });
 document.getElementById('pause-controls').addEventListener('click', ()=>{
   showToast('Controles: D-pad / stick / ATK / SUBIR');
 });
+
+if(EDIT_MODE) startGame();
 
 })();
 </script>
