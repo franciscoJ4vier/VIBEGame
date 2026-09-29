@@ -23,7 +23,7 @@
   .icon-btn.car-on  { background:rgba(255,168,77,.22); }
   .icon-btn.active { background:rgba(255,202,103,.22); border-color:rgba(255,218,150,.72); }
   #viewport { width:100vw; height:100vh; aspect-ratio:auto; position:relative; flex-shrink:0; overflow:hidden; background:#000; border:none; box-shadow:none; }
-  #canvas { display:block; width:100%; height:100%; image-rendering:pixelated; image-rendering:-moz-crisp-edges; touch-action:none; position:absolute; inset:0; }
+  #canvas { display:block; width:100%; height:100%; touch-action:none; position:absolute; inset:0; }
   .pixel-panel { background:rgba(12,12,12,.64); border:2px solid rgba(216,206,176,.28); box-shadow:inset 0 0 0 1px rgba(255,255,255,.04); }
   .hud-stats { position:absolute; top:14px; left:14px; z-index:14; display:flex; flex-direction:column; gap:7px; pointer-events:none; }
   .hp-wrap { width:200px; height:18px; background:rgba(16,10,10,.76); border:2px solid rgba(214,95,66,.68); overflow:hidden; position:relative; }
@@ -96,6 +96,7 @@
     #minimap { top:12px; right:12px; width:80px; height:80px; }
     #boss-bar { width:min(180px, 62vw); }
     .controls { position:absolute; left:0; right:0; bottom:0; width:100%; background:linear-gradient(180deg,transparent 0%,rgba(7,10,12,.24) 35%,rgba(7,10,12,.52) 100%); padding:12px 12px calc(12px + env(safe-area-inset-bottom)); opacity:.85; }
+    .joy-wrap { transform:translateY(-16px); }
     #toast { bottom:110px; width:min(74vw, 320px); }
     .hud-title { font-size:11px; letter-spacing:.09em; }
     .icon-btn { width:40px; height:40px; }
@@ -231,7 +232,7 @@ function makeNoise2D(seed){
   }
   return function(x,y){
     let total=0, amp=1, freq=1, max=0;
-    const OCT = isMobile ? 3 : 4;
+    const OCT = 4;
     for(let o=0;o<OCT;o++){ total+=noise(x*freq,y*freq)*amp; max+=amp; amp*=0.5; freq*=2.1; }
     return total/max;
   };
@@ -271,9 +272,9 @@ const SFX = {
 /* ══════════════════════════════════════════════════════════════
    CONFIGURACIÓN
    ══════════════════════════════════════════════════════════════ */
-const BASE_RESOLUTION_SCALE = isMobile ? 7.5 : 5.5;
+const BASE_RESOLUTION_SCALE = isMobile ? 1.5 : 5.5;
+const MAX_RESOLUTION_SCALE = isMobile ? 4.5 : 12;
 let lowResDynamic = BASE_RESOLUTION_SCALE;
-const RGB_BITS = isMobile ? 10 : 12;
 const FIXED_SEED = 20240915;
 const GRID = 700;
 const CELL = 10;
@@ -450,7 +451,7 @@ function initThree(){
     canvas, antialias:false, powerPreference:'high-performance',
     preserveDrawingBuffer:true, stencil:false, depth:true,
   });
-  renderer.setPixelRatio(isMobile ? 0.8 : 1.0);
+  renderer.setPixelRatio(1.0);
   renderer.autoClear = false;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -476,8 +477,7 @@ function initThree(){
   postCam = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
   postMat = new THREE.ShaderMaterial({
     uniforms:{
-      tDiffuse:{value:null}, res:{value:new THREE.Vector2(320,320)},
-      levels:{value:RGB_BITS}, time:{value:0},
+      tDiffuse:{value:null}, time:{value:0},
       tint:{value:new THREE.Color(1.00,1.00,0.98)},
       saturation:{value:1.00}, shipMode:{value:0.0},
       nightFactor:{value:0.0},
@@ -486,29 +486,25 @@ function initThree(){
     fragmentShader:`
       precision mediump float;
       uniform sampler2D tDiffuse;
-      uniform vec2 res;
-      uniform float levels, time, saturation, shipMode, nightFactor;
+      uniform float time, saturation, shipMode, nightFactor;
       uniform vec3 tint;
       varying vec2 vUv;
-      float bayer(vec2 p){
-        float x=mod(p.x,4.0), y=mod(p.y,4.0);
-        if(x<1.0){if(y<1.0)return 0.0;else if(y<2.0)return 12.0;else if(y<3.0)return 3.0;else return 15.0;}
-        else if(x<2.0){if(y<1.0)return 8.0;else if(y<2.0)return 4.0;else if(y<3.0)return 11.0;else return 7.0;}
-        else if(x<3.0){if(y<1.0)return 2.0;else if(y<2.0)return 14.0;else if(y<3.0)return 1.0;else return 13.0;}
-        else {if(y<1.0)return 10.0;else if(y<2.0)return 6.0;else if(y<3.0)return 9.0;else return 5.0;}
-      }
       void main(){
         vec4 c=texture2D(tDiffuse,vUv);
         float lum=dot(c.rgb,vec3(0.299,0.587,0.114));
-        c.rgb=mix(vec3(lum),c.rgb,saturation);
-        vec2 pix=floor(vUv*res);
-        float d=(bayer(pix)/16.0)-0.5;
-        c.rgb+=d/levels;
-        c.rgb=floor(c.rgb*levels+0.5)/levels;
+        c.rgb=(c.rgb-0.5)*1.12+0.5;
+        c.rgb=mix(vec3(lum),c.rgb,saturation*1.08);
+        float highlights=smoothstep(0.2,0.82,lum);
+        c.rgb=mix(c.rgb,c.rgb*vec3(1.08,1.02,0.92),highlights*0.42);
+        c.rgb=mix(c.rgb,c.rgb*vec3(0.9,0.95,1.04),(1.0-highlights)*0.12);
         c.rgb*=tint;
         c.rgb=mix(c.rgb, c.rgb*vec3(0.8,0.88,1.0), nightFactor*0.25);
         c.rgb=mix(c.rgb, c.rgb*vec3(0.98,0.99,1.0), shipMode*0.15);
-        gl_FragColor=vec4(c.rgb,1.0);
+        float vignette=smoothstep(0.38,0.9,length((vUv-0.5)*vec2(1.0,1.2)));
+        float grain=fract(sin(dot(gl_FragCoord.xy+time,vec2(12.9898,78.233)))*43758.5453);
+        c.rgb*=1.0-vignette*0.18;
+        c.rgb+=(grain-0.5)*0.025;
+        gl_FragColor=vec4(clamp(c.rgb,0.0,1.0),1.0);
       }
     `,
     depthTest:false, depthWrite:false,
@@ -534,10 +530,9 @@ function resize(){
   const lh = Math.max(1, Math.round(longSide * Math.min(1, 1 / aspect)));
   if(renderTarget) renderTarget.dispose();
   renderTarget = new THREE.WebGLRenderTarget(lw,lh,{
-    minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter,
+    minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter,
     format:THREE.RGBAFormat, stencilBuffer:false, depthBuffer:true,
   });
-  postMat.uniforms.res.value.set(lw,lh);
   const jb = document.getElementById('joyBase');
   if(jb) joyRadius = jb.clientWidth * 0.40;
 }
@@ -6333,8 +6328,8 @@ function loop(t){
     if(inShip) altEl.textContent = 'NAVE · ALT '+Math.round(shipState.y)+'m · VEL '+Math.round(shipState.speed);
     else if(inCar) altEl.textContent = 'AUTO · VEL '+Math.round(Math.abs(carState.speed))+' km/h';
     else altEl.textContent = 'ALT '+Math.round(playerState.y)+'m';
-    if(fps < 28 && lowResDynamic < 12){
-      lowResDynamic = Math.min(12, lowResDynamic + 0.7);
+    if(fps < 28 && lowResDynamic < MAX_RESOLUTION_SCALE){
+      lowResDynamic = Math.min(MAX_RESOLUTION_SCALE, lowResDynamic + 0.7);
       resize();
     } else if(fps > 50 && lowResDynamic > BASE_RESOLUTION_SCALE){
       lowResDynamic = Math.max(BASE_RESOLUTION_SCALE, lowResDynamic - 0.25);
@@ -6403,7 +6398,7 @@ document.getElementById('btn-flashlight').addEventListener('click', toggleFlashl
 document.getElementById('pause-continue').addEventListener('click', ()=>togglePause());
 document.getElementById('pause-mute').addEventListener('click', toggleMute);
 document.getElementById('pause-quality').addEventListener('click', ()=>{
-  lowResDynamic = lowResDynamic <= 4 ? 6 : 4;
+  lowResDynamic = lowResDynamic <= 4 ? (isMobile ? 3 : 6) : (isMobile ? 1 : 4);
   resize();
   showToast(lowResDynamic <= 4 ? 'Calidad: alta' : 'Calidad: baja');
 });
