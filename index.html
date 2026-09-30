@@ -23,7 +23,7 @@
   .icon-btn.car-on  { background:rgba(255,168,77,.22); }
   .icon-btn.active { background:rgba(255,202,103,.22); border-color:rgba(255,218,150,.72); }
   #viewport { width:100vw; height:100vh; aspect-ratio:auto; position:relative; flex-shrink:0; overflow:hidden; background:#000; border:none; box-shadow:none; }
-  #canvas { display:block; width:100%; height:100%; touch-action:none; position:absolute; inset:0; }
+  #canvas { display:block; width:100%; height:100%; touch-action:none; position:absolute; inset:0; image-rendering:auto; }
   .pixel-panel { background:rgba(12,12,12,.64); border:2px solid rgba(216,206,176,.28); box-shadow:inset 0 0 0 1px rgba(255,255,255,.04); }
   .hud-stats { position:absolute; top:14px; left:14px; z-index:14; display:flex; flex-direction:column; gap:7px; pointer-events:none; }
   .hp-wrap { width:200px; height:18px; background:rgba(16,10,10,.76); border:2px solid rgba(214,95,66,.68); overflow:hidden; position:relative; }
@@ -272,8 +272,10 @@ const SFX = {
 /* ══════════════════════════════════════════════════════════════
    CONFIGURACIÓN
    ══════════════════════════════════════════════════════════════ */
-const BASE_RESOLUTION_SCALE = isMobile ? 2 : 2;
-const MAX_RESOLUTION_SCALE = isMobile ? 5.5 : 4.0;
+// Resolucion de dibujo = pantalla / escala. Antes 2.0-2.4 (mitad de pixeles = muy pixelado). Ahora casi pantalla completa;
+// si los fps bajan de 28 el juego sube la escala solo (mas pixelado) hasta MAX y vuelve a bajarla cuando hay fps de sobra.
+const BASE_RESOLUTION_SCALE = isMobile ? 1.25 : 1;
+const MAX_RESOLUTION_SCALE = isMobile ? 1.8 : 1.6;   // tope bajo: subirlo mucho = imagen borrosa
 let lowResDynamic = BASE_RESOLUTION_SCALE;
 const FIXED_SEED = 20240915;
 const GRID = 700;
@@ -456,7 +458,7 @@ function initThree(){
     canvas, antialias:false, powerPreference:'high-performance',
     preserveDrawingBuffer:true, stencil:false, depth:true,
   });
-  renderer.setPixelRatio(1.0);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
   renderer.autoClear = false;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
@@ -489,7 +491,11 @@ function initThree(){
     },
     vertexShader:`varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.0,1.0); }`,
     fragmentShader:`
+      #ifdef GL_FRAGMENT_PRECISION_HIGH
+      precision highp float;
+      #else
       precision mediump float;
+      #endif
       uniform sampler2D tDiffuse;
       uniform vec2 res;
       uniform float time, saturation, shipMode, nightFactor;
@@ -504,6 +510,9 @@ function initThree(){
       }
       void main(){
         vec4 c=texture2D(tDiffuse,vUv);
+        vec2 px=1.0/res;                                   // nitidez: realza bordes para quitar el aspecto borroso
+        vec3 nb=(texture2D(tDiffuse,vUv+vec2(px.x,0.0)).rgb+texture2D(tDiffuse,vUv-vec2(px.x,0.0)).rgb+texture2D(tDiffuse,vUv+vec2(0.0,px.y)).rgb+texture2D(tDiffuse,vUv-vec2(0.0,px.y)).rgb)*0.25;
+        c.rgb+=(c.rgb-nb)*0.7;
         float lum=dot(c.rgb,vec3(0.299,0.587,0.114));
         c.rgb=(c.rgb-0.5)*1.08+0.5;
         c.rgb=mix(vec3(lum),c.rgb,saturation);
@@ -511,7 +520,7 @@ function initThree(){
         c.rgb=mix(c.rgb, c.rgb*vec3(0.8,0.88,1.0), nightFactor*0.25);
         c.rgb=mix(c.rgb, c.rgb*vec3(0.98,0.99,1.0), shipMode*0.15);
         float d=(bayer(floor(vUv*res))/16.0)-0.5;
-        c.rgb=floor(c.rgb*24.0+0.5+d)/24.0;
+        c.rgb=floor(c.rgb*160.0+0.5+d)/160.0;   // antes 24 niveles (posterizado); ahora casi continuo, solo un dither fino anti-bandas
         gl_FragColor=vec4(clamp(c.rgb,0.0,1.0),1.0);
       }
     `,
@@ -532,15 +541,20 @@ function resize(){
   if(vmCam){ vmCam.aspect = w/h; vmCam.updateProjectionMatrix(); }
   if(shipCam){ shipCam.aspect = w/h; shipCam.updateProjectionMatrix(); }
   if(carCam){ carCam.aspect = w/h; carCam.updateProjectionMatrix(); }
-  const longSide = Math.max(120, Math.floor(Math.max(w, h) / lowResDynamic));
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);   // pixeles reales: el celular ya no agranda el pixel
+  const longSide = Math.min(isMobile ? 2000 : 2600, Math.max(120, Math.floor(Math.max(w, h) * dpr / lowResDynamic)));
   const aspect = w / h;
   const lw = Math.max(1, Math.round(longSide * Math.min(1, aspect)));
   const lh = Math.max(1, Math.round(longSide * Math.min(1, 1 / aspect)));
   if(renderTarget) renderTarget.dispose();
-  renderTarget = new THREE.WebGLRenderTarget(lw,lh,{
-    minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter,
+  // Suavizado: filtro lineal + antialiasing MSAA 4x (solo escritorio con WebGL2) => bordes sin escalones.
+  const useMSAA = !isMobile && renderer.capabilities.isWebGL2 && THREE.WebGLMultisampleRenderTarget;
+  const RTClass = useMSAA ? THREE.WebGLMultisampleRenderTarget : THREE.WebGLRenderTarget;
+  renderTarget = new RTClass(lw,lh,{
+    minFilter:THREE.LinearFilter, magFilter:THREE.LinearFilter,
     format:THREE.RGBAFormat, stencilBuffer:false, depthBuffer:true,
   });
+  if(useMSAA) renderTarget.samples = 2;
   postMat.uniforms.res.value.set(lw,lh);
   const jb = document.getElementById('joyBase');
   if(jb) joyRadius = jb.clientWidth * 0.40;
@@ -1360,9 +1374,9 @@ const CABIN_SHELL_PIECES = [
   // manija / boton de ventana
   { name:'handle',  z:-0.88, color:0x9aa0a6, pts:[[0.95,-0.435],[0.79,-0.475],[0.79,-0.495],[0.95,-0.455]] },
   // pilar A: ancho e inclinado, converge hacia arriba
-  { name:'pillarA', z:-1.00, color:0x0e0f12, pts:[[0.88,-0.19],[0.62,-0.33],[0.44,0.78],[0.64,0.75]] },
+  { name:'pillarA', z:-1.00, color:0x0e0f12, pts:[[0.90,-0.19],[0.76,-0.27],[0.575,0.79],[0.665,0.77]] },
   // techo lateral (riel)
-  { name:'rail',    z:-1.00, color:0x0e0f12, pts:[[0.44,0.78],[1.03,0.64],[1.03,1.05],[0.44,1.05]] },
+  { name:'rail',    z:-1.00, color:0x0e0f12, pts:[[0.575,0.85],[1.03,0.70],[1.03,1.05],[0.575,1.05]] },
   // marco del borde (pilar B)
   { name:'pillarB', z:-0.99, color:0x0e0f12, pts:[[0.95,-0.12],[1.03,-0.12],[1.03,0.64],[0.95,0.64]] },
 ];
@@ -1587,14 +1601,108 @@ function renderCabinMirrors(){
 // Ajusta aqui: posicion del volante, colores, codos y hombros.
 const DRIVER = {
   wheel:  { x:-0.07, y:-0.40, z:-0.78, s:0.56 },
-  skin:0x9c6b48, sleeve:0x1a2431, pants:0x151a20, shoe:0x0b0c0e,
+  skin:0x9c6b48, sleeve:0x1f5fb3, pants:0x173f80, shoe:0x0b0c0e,
   cowlColor:0x3b3129, footColor:0x121316,
   shoulderL:[-0.29,-0.16,0.20], shoulderR:[0.19,-0.16,0.20],
-  elbowL:[-0.38,-0.52,-0.16],   elbowR:[0.28,-0.52,-0.16],
+  elbowL:[-0.40,-0.55,-0.10],   elbowR:[0.24,-0.55,-0.10],
   hipL:[-0.18,-0.62,0.20],      hipR:[0.08,-0.62,0.20],
   kneeL:[-0.19,-0.52,-0.32],    kneeR:[0.09,-0.52,-0.32],
   ankleL:[-0.19,-0.76,-0.48],   ankleR:[0.09,-0.76,-0.48],
 };
+// ===== PERSONAJES MAS REALISTAS: mallas suaves, textura pintada en la cara, cabello de rizos reales =====
+// LIMB_GEO: cilindro de 14 lados (brazos, muslos, piernas). BLOB0/BLOB1: esferas suaves para articulaciones, manos y botas.
+// loftMesh: torso suave por anillos. tubeMesh: mechones de cabello (tubos con rizo helicoidal). smoothNormals: normales suaves.
+const LIMB_GEO = new THREE.CylinderGeometry(0.46, 0.5, 1, 14, 1);
+const BLOB0 = new THREE.SphereGeometry(0.5, 12, 9);
+const BLOB1 = new THREE.SphereGeometry(0.5, 22, 16);
+function limbMesh(mat){ const m = new THREE.Mesh(LIMB_GEO, mat); m.frustumCulled = false; return m; }
+function blobMesh(mat, w, h, d, x, y, z, detail){
+  const m = new THREE.Mesh(detail === 0 ? BLOB0 : BLOB1, mat);
+  m.scale.set(w, h, d); m.position.set(x, y, z); m.frustumCulled = false; return m;
+}
+// Normales suaves para una malla SIN indices: promedia las normales de los triangulos que comparten posicion.
+function smoothNormals(geo){
+  const pa = geo.attributes.position, n = pa.count, acc = new Map(), key = i => Math.round(pa.getX(i) * 1e4) + ',' + Math.round(pa.getY(i) * 1e4) + ',' + Math.round(pa.getZ(i) * 1e4);
+  const a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3(), nn = new THREE.Vector3();
+  for(let f = 0; f < n; f += 3){
+    a.set(pa.getX(f), pa.getY(f), pa.getZ(f)); b.set(pa.getX(f + 1), pa.getY(f + 1), pa.getZ(f + 1)); c.set(pa.getX(f + 2), pa.getY(f + 2), pa.getZ(f + 2));
+    nn.subVectors(c, b).cross(a.clone().sub(b));
+    for(let k = 0; k < 3; k++){ const kk = key(f + k); const v = acc.get(kk) || [0, 0, 0]; v[0] += nn.x; v[1] += nn.y; v[2] += nn.z; acc.set(kk, v); }
+  }
+  const N = new Float32Array(n * 3);
+  for(let i = 0; i < n; i++){
+    const v = acc.get(key(i)), l = Math.hypot(v[0], v[1], v[2]) || 1;
+    N[i * 3] = v[0] / l; N[i * 3 + 1] = v[1] / l; N[i * 3 + 2] = v[2] / l;
+  }
+  geo.setAttribute('normal', new THREE.BufferAttribute(N, 3));
+}
+// Torso suave: rings = [y, mediaAnchoX, mediaProfundidadZ]; se interpola con Catmull-Rom entre anillos. colors: uno por banda.
+function loftMesh(rings, colors, N){
+  N = N || 18;
+  const SUB = 3, dense = [], cr = (a, b, c, d, t) => 0.5 * ((2 * b) + (-a + c) * t + (2 * a - 5 * b + 4 * c - d) * t * t + (-a + 3 * b - 3 * c + d) * t * t * t);
+  for(let i = 0; i < rings.length - 1; i++){
+    const r0 = rings[Math.max(0, i - 1)], r1 = rings[i], r2 = rings[i + 1], r3 = rings[Math.min(rings.length - 1, i + 2)];
+    for(let q = 0; q < SUB; q++){ const t = q / SUB; dense.push({ y:cr(r0[0], r1[0], r2[0], r3[0], t), w:cr(r0[1], r1[1], r2[1], r3[1], t), d:cr(r0[2], r1[2], r2[2], r3[2], t), band:i }); }
+  }
+  const last = rings[rings.length - 1]; dense.push({ y:last[0], w:last[1], d:last[2], band:colors.length - 1 });
+  const P = [], C = [], I = [], col = new THREE.Color();
+  dense.forEach(r => { col.set(colors[Math.min(colors.length - 1, r.band)]);
+    for(let k = 0; k < N; k++){ const a = k / N * Math.PI * 2; P.push(r.w * Math.cos(a), r.y, r.d * Math.sin(a)); C.push(col.r, col.g, col.b); } });
+  for(let j = 0; j < dense.length - 1; j++) for(let k = 0; k < N; k++){
+    const a = j * N + k, b = j * N + (k + 1) % N, c = (j + 1) * N + k, d = (j + 1) * N + (k + 1) % N;
+    I.push(a, c, b, b, c, d);
+  }
+  [[0, 0], [dense.length - 1, dense.length - 1]].forEach(([ri, rj], ci) => {
+    const idx = P.length / 3; P.push(0, dense[ri].y, 0); col.set(colors[ci ? colors.length - 1 : 0]); C.push(col.r, col.g, col.b);
+    for(let k = 0; k < N; k++) I.push(idx, rj * N + k, rj * N + (k + 1) % N);
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
+  g.setIndex(I); g.computeVertexNormals();
+  const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors:true, side:THREE.DoubleSide }));
+  m.frustumCulled = false; return m;
+}
+// Mechones de cabello: cada uno es un tubo que va de S a E con un arco B y un rizo helicoidal.
+// lock = {S,E,B,curl,turns,phase,r0,r1,col}. Todo el cabello se une en UNA malla con brillo (Phong).
+function tubeMesh(locks, segs, sides){
+  segs = segs || 22; sides = sides || 5;
+  const P = [], C = [], I = [], col = new THREE.Color();
+  const V = a => new THREE.Vector3(a[0], a[1], a[2]);
+  locks.forEach(L => {
+    const S = V(L.S), E = V(L.E), B = V(L.B || [0, 0, 0]), ax = E.clone().sub(S), axl = ax.length() || 1e-3, ad = ax.clone().multiplyScalar(1 / axl);
+    const ref = Math.abs(ad.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0);
+    const u = new THREE.Vector3().crossVectors(ad, ref).normalize(), v = new THREE.Vector3().crossVectors(ad, u).normalize();
+    const pts = [];
+    for(let i = 0; i <= segs; i++){
+      const t = i / segs, p = S.clone().addScaledVector(ax, t).addScaledVector(B, Math.sin(Math.PI * t));
+      const amp = L.curl * Math.min(1, t * 3.2) * (0.55 + 0.45 * t), ang = L.turns * Math.PI * 2 * t + (L.phase || 0);
+      p.addScaledVector(u, Math.cos(ang) * amp).addScaledVector(v, Math.sin(ang) * amp); pts.push(p);
+    }
+    let nrm = null; const base = P.length / 3;
+    for(let i = 0; i <= segs; i++){
+      const a = pts[Math.max(0, i - 1)], b = pts[Math.min(segs, i + 1)], T = b.clone().sub(a).normalize();
+      if(!nrm){ nrm = new THREE.Vector3().crossVectors(T, Math.abs(T.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : new THREE.Vector3(0, 1, 0)).normalize(); }
+      else { nrm.addScaledVector(T, -nrm.dot(T)).normalize(); }
+      const bin = new THREE.Vector3().crossVectors(T, nrm).normalize(), t = i / segs, r = L.r0 + (L.r1 - L.r0) * t;
+      col.set(L.col).multiplyScalar(0.72 + 0.55 * Math.sin(Math.PI * Math.min(1, t * 1.15)) * (0.55 + 0.45 * _rnd(i, sides)));
+      for(let k = 0; k < sides; k++){
+        const a2 = k / sides * Math.PI * 2, cx = Math.cos(a2) * r, cy = Math.sin(a2) * r;
+        P.push(pts[i].x + nrm.x * cx + bin.x * cy, pts[i].y + nrm.y * cx + bin.y * cy, pts[i].z + nrm.z * cx + bin.z * cy);
+        C.push(col.r, col.g, col.b);
+      }
+    }
+    for(let i = 0; i < segs; i++) for(let k = 0; k < sides; k++){
+      const a = base + i * sides + k, b = base + i * sides + (k + 1) % sides, c = base + (i + 1) * sides + k, d = base + (i + 1) * sides + (k + 1) % sides;
+      I.push(a, c, b, b, c, d);
+    }
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3)); g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
+  g.setIndex(I); g.computeVertexNormals();
+  const m = new THREE.Mesh(g, new THREE.MeshPhongMaterial({ vertexColors:true, specular:0x241f2c, shininess:26, side:THREE.DoubleSide }));
+  m.frustumCulled = false; return m;
+}
+
 const _limbY = new THREE.Vector3(0, 1, 0);
 function setLimb(m, a, b, t){
   const d = new THREE.Vector3().subVectors(b, a);
@@ -1615,37 +1723,64 @@ function buildCabinDriver(p, hw, hh){
   let D = ud.driver;
   if(!D){
     D = ud.driver = {};
-    const lam = c => new THREE.MeshLambertMaterial({ color:c, flatShading:true });
+    const lam = c => new THREE.MeshLambertMaterial({ color:c });
     const skin = lam(DRIVER.skin), sleeve = lam(DRIVER.sleeve), pants = lam(DRIVER.pants), shoe = lam(DRIVER.shoe);
+    const navy = lam(0x10284f), steel = lam(0xb8bec6), pad = lam(0x0f2a58), toe = lam(0x2a2d33), sole = lam(0x1a1c20), wface = lam(0x0d1418), seam = lam(0x173f80);
     const unit = m => { const b = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1), m); b.frustumCulled = false; carGroup.add(b); return b; };
+    const lunit = m => { const b = limbMesh(m); carGroup.add(b); return b; };                       // extremidad facetada
+    const blobU = (m, sz) => { const b = new THREE.Mesh(BLOB1, m); b.scale.setScalar(sz); b.frustumCulled = false; carGroup.add(b); return b; };
 
     // Torso y piernas (fijos).
-    const torso = unit(sleeve); torso.scale.set(0.52, 0.56, 0.26); torso.position.set(-0.05, -0.36, 0.22);
+    const torso = loftMesh([[-0.64, 0.24, 0.13], [-0.50, 0.22, 0.12], [-0.36, 0.25, 0.13], [-0.18, 0.27, 0.12], [-0.08, 0.15, 0.10]],
+                           [0x173f80, 0x1f5fb3, 0x1f5fb3, 0x2f74cc], 18);
+    torso.position.set(-0.05, 0, 0.22); carGroup.add(torso);                                       // torso facetado
     const belt = unit(lam(0x14161a)); belt.scale.set(0.54, 0.05, 0.28); belt.position.set(-0.05, -0.62, 0.22);
     ['L','R'].forEach(k => {
-      setLimb(unit(pants), V(DRIVER['hip'+k]), V(DRIVER['knee'+k]), 0.17);
-      setLimb(unit(pants), V(DRIVER['knee'+k]), V(DRIVER['ankle'+k]), 0.14);
-      const sh = unit(shoe); sh.scale.set(0.16, 0.08, 0.30);
+      setLimb(lunit(pants), V(DRIVER['hip'+k]), V(DRIVER['knee'+k]), 0.17);
+      setLimb(lunit(pants), V(DRIVER['knee'+k]), V(DRIVER['ankle'+k]), 0.14);
+      { const kb = blobU(pants, 0.16); kb.position.copy(V(DRIVER['knee'+k])); }
+      const sh = unit(shoe); sh.geometry = BLOB1; sh.scale.set(0.18, 0.10, 0.34);
       sh.position.set(DRIVER['ankle'+k][0], DRIVER['ankle'+k][1] - 0.03, DRIVER['ankle'+k][2] - 0.08);
+      // Detalles del mono y las botas: bolsillo cargo, rodillera, suela y puntera.
+      const sd = k === 'L' ? -1 : 1, hp = V(DRIVER['hip'+k]), kn = V(DRIVER['knee'+k]), an = V(DRIVER['ankle'+k]);
+      const pk = unit(navy); pk.scale.set(0.024, 0.11, 0.15); pk.position.set((hp.x + kn.x) / 2 + sd * 0.088, (hp.y + kn.y) / 2 + 0.01, (hp.z + kn.z) / 2 + 0.02);
+      const pf = unit(seam); pf.scale.set(0.026, 0.03, 0.15); pf.position.set(pk.position.x + sd * 0.002, pk.position.y + 0.06, pk.position.z);
+      const kp = unit(pad); kp.geometry = BLOB1; kp.scale.set(0.16, 0.05, 0.11); kp.position.set(kn.x, kn.y + 0.088, kn.z + 0.01);
+      const sl = unit(sole); sl.scale.set(0.17, 0.022, 0.33); sl.position.set(an.x, an.y - 0.076, an.z - 0.08);
+      const tc = unit(toe); tc.scale.set(0.15, 0.05, 0.10); tc.position.set(an.x, an.y - 0.03, an.z - 0.21);
+      const sk = unit(steel); sk.scale.set(0.05, 0.012, 0.02); sk.position.set(an.x, an.y + 0.012, an.z - 0.13);     // cordones
     });
 
     // Brazos (se recalculan cada cuadro) y manos (hijas del volante).
     ['L','R'].forEach(k => {
-      D['upper'+k] = unit(sleeve);
-      D['fore'+k]  = unit(sleeve);
-      D['wrist'+k] = unit(skin);
+      D['upper'+k] = lunit(sleeve);
+      D['fore'+k]  = lunit(sleeve);
+      D['cuff'+k]  = lunit(navy);
+      D['watch'+k] = lunit(steel); D['wface'+k] = lunit(wface);
+      D['watch'+k].visible = D['wface'+k].visible = (k === 'L');
+      D['wrist'+k] = lunit(skin);
+      D['eb'+k] = blobU(sleeve, 0.105); D['sb'+k] = blobU(sleeve, 0.12);   // codo y hombro redondeados (facetados)
       const side = k === 'L' ? -1 : 1;
       const g = new THREE.Group();
-      const add = (w, h, d, x, y, z) => { const b = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), skin); b.position.set(x, y, z); g.add(b); };
-      add(0.11, 0.17, 0.06, 0, 0, 0.09);                                   // dorso de la mano
+      // u = hacia el centro del volante (positivo) o hacia afuera (negativo); y = a lo largo del aro; z = hacia el conductor.
+      // Mano realista: palma + 4 dedos de 3 falanges que rodean el tubo del aro + pulgar apoyado arriba.
+      const Vc = (x, y, z) => new THREE.Vector3(x, y, z), RR = 0.060, dg = Math.PI / 180;
+      const ring = (a, y) => Vc(-side * RR * Math.cos(a * dg), y, RR * Math.sin(a * dg));
+      const seg = (a, b, t) => { const m = limbMesh(skin); g.add(m); setLimb(m, a, b, t); };
+      const jt = (q, r) => g.add(blobMesh(skin, r * 2, r * 2, r * 2, q.x, q.y, q.z, 0));
+      const palm = blobMesh(skin, 0.135, 0.132, 0.040, side * 0.085, -0.012, 0.074, 1);
+      palm.rotation.y = Math.atan2(-0.054, side * 0.104); g.add(palm);
+      g.add(blobMesh(skin, 0.070, 0.095, 0.055, side * 0.115, -0.045, 0.090, 1));   // talon de la mano
+      const ANG = [[128, 86, 34, -22], [128, 86, 34, -24], [128, 86, 36, -18], [128, 88, 40, -8]];
       for(let i = 0; i < 4; i++){
-        const y = -0.066 + i * 0.044;
-        add(0.075, 0.038, 0.055, -side * 0.085, y, 0.085);                 // dedos envolviendo el aro
-        add(0.030, 0.038, 0.075, -side * 0.128, y, 0.045);                 // puntas de los dedos por detras
+        const y = 0.054 - i * 0.036, q = ANG[i].map(a => ring(a, y));
+        jt(q[0], 0.0155);
+        for(let j = 0; j < 3; j++){ seg(q[j], q[j + 1], 0.028 - j * 0.003 - (i === 3 ? 0.003 : 0)); jt(q[j + 1], 0.0145 - j * 0.0015); }
       }
-      add(0.05, 0.075, 0.04, side * 0.07, 0.07, 0.10);                     // pulgar
-      const anchor = new THREE.Object3D(); anchor.position.set(0, 0, 0.11); g.add(anchor);
-      g.position.set(side * 0.36, 0.02, 0);
+      const thumb = [Vc(side * 0.062, 0.074, 0.072), Vc(side * 0.030, 0.112, 0.066), Vc(side * 0.000, 0.142, 0.056)];
+      jt(thumb[0], 0.0185); seg(thumb[0], thumb[1], 0.033); jt(thumb[1], 0.0165); seg(thumb[1], thumb[2], 0.028); jt(thumb[2], 0.0145);
+      const anchor = new THREE.Object3D(); anchor.position.set(-side * -0.14, -0.08, 0.10); g.add(anchor);   // muneca
+      g.position.set(side * 0.355, 0.03, 0);
       wg.add(g);
       D['hand'+k] = g; D['anchor'+k] = anchor;
     });
@@ -1657,6 +1792,7 @@ function buildCabinDriver(p, hw, hh){
     };
     D.cowl = plane(DRIVER.cowlColor);
     D.foot = plane(DRIVER.footColor);
+
     D.key = '';
   }
 
@@ -1675,9 +1811,16 @@ function buildCabinDriver(p, hw, hh){
     const dir = wrist.clone().sub(elbow), len = dir.length();
     dir.normalize();
     const cuff = elbow.clone().addScaledVector(dir, Math.max(0.05, len - 0.09));
-    setLimb(D['fore'+k],  elbow, cuff, 0.085);
-    setLimb(D['wrist'+k], cuff, wrist, 0.058);
-    setLimb(D['upper'+k], shoulder, elbow, 0.095);
+    setLimb(D['fore'+k],  elbow, cuff, 0.072);
+    setLimb(D['wrist'+k], cuff, wrist, 0.052);
+    setLimb(D['upper'+k], shoulder, elbow, 0.090);
+    D['eb'+k].position.copy(elbow); D['sb'+k].position.copy(shoulder);
+    setLimb(D['cuff'+k], cuff.clone().addScaledVector(dir, -0.035), cuff.clone().addScaledVector(dir, 0.02), 0.082);     // puno azul marino
+    if(k === 'L'){                                                                                                        // reloj en la muneca izquierda
+      setLimb(D.watchL, cuff.clone().addScaledVector(dir, 0.040), cuff.clone().addScaledVector(dir, 0.072), 0.064);
+      const up = new THREE.Vector3(0, 0.033, 0);
+      setLimb(D.wfaceL, cuff.clone().addScaledVector(dir, 0.044).add(up), cuff.clone().addScaledVector(dir, 0.070).add(up), 0.048);
+    }
   });
 
   // Rellenos (dependen del ancho de pantalla).
@@ -1689,6 +1832,541 @@ function buildCabinDriver(p, hw, hh){
     D.foot.position.set(0, -0.665 * hh, -1.06);
     D.foot.scale.set(2.10 * hw, 0.73 * hh, 1);
   }
+}
+
+
+// ===== COPILOTO + CONSOLA CENTRAL + ASIENTOS =====
+// Todo en metros reales con la camara en los ojos del conductor (x derecha, y arriba, -z adelante).
+// El copiloto tiene cuerpo con proporciones humanas: torso, hombros, cuello, cabeza con nariz/orejas/pelo,
+// caderas, muslos, piernas y zapatos. Los brazos usan IK de 2 huesos: el codo se dobla solo hacia abajo y afuera,
+// asi nunca queda un brazo recto flotando. Las manos se anclan en coordenadas de pantalla (ndc) para verse
+// siempre en el borde derecho aunque cambie el ancho.
+// Ajusta aqui: posicion del asiento (seatX), colores, y donde apoya cada mano (ndc = x,y de pantalla; z = profundidad).
+const PASSENGER = {
+  x:0.80, floorY:-0.78, z:-0.06,       // donde va el asiento en la cabina (piso del auto)
+  scale:0.72,                          // tamano de la copiloto (0.72 = proporcion coherente con la cabina)
+  bodyYaw:0.42,                        // torso girado ~24 grados hacia el conductor (pose 3/4 de la referencia)
+  headYaw:0.0,                         // hacia donde mira normalmente: 0 = al frente, a la carretera
+  glanceYaw:1.35,                      // cuanto gira la cabeza (respecto al frente) cuando te mira a ti
+  glanceEvery:16,                      // cada cuantos segundos te mira (con variacion); la mirada dura 3.5-5 s con giro lento
+  panelHand:[1.095, -0.33, -0.46],       // mano derecha tocando los botones del panel rojo (coordenadas de cabina)
+  handL:[-0.12, 0.125, -0.30],         // mano izquierda apoyada en el muslo (coordenadas locales del cuerpo)
+  upperArm:0.31, foreArm:0.28,
+};
+const CONSOLE = { x:0.30, w:0.26, topY:-0.46, zFront:-0.98, zBack:0.32 };
+
+function cabinLam(c){ return new THREE.MeshLambertMaterial({ color:c }); }
+function cabinBox(parent, mat, w, h, d, x, y, z){
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z); m.frustumCulled = false; parent.add(m); return m;
+}
+function solveElbow(S, W, upper, fore, pole){
+  const d0 = new THREE.Vector3().subVectors(W, S);
+  const d = Math.max(0.05, d0.length());
+  const k = Math.max(1, d / ((upper + fore) * 0.985));
+  const u = upper * k, f = fore * k;
+  const dir = d0.clone().multiplyScalar(1 / d);
+  const a = (u * u - f * f + d * d) / (2 * d);
+  const h = Math.sqrt(Math.max(0, u * u - a * a));
+  const p = pole.clone().addScaledVector(dir, -pole.dot(dir)).normalize();
+  return new THREE.Vector3().copy(S).addScaledVector(dir, a).addScaledVector(p, h);
+}
+// Mezcla muchos cubos [x,y,z,w,h,d,color] en UNA sola malla con color por vertice (estilo voxel, barato de dibujar).
+const _voxBox = new THREE.BoxGeometry(1, 1, 1);
+function voxMesh(list){
+  const P = [], N = [], C = [], I = [], col = new THREE.Color();
+  const bp = _voxBox.attributes.position.array, bn = _voxBox.attributes.normal.array, bi = _voxBox.index.array;
+  let o = 0;
+  list.forEach(v => {
+    col.set(v[6]);
+    for(let i = 0; i < 24; i++){
+      P.push(bp[i*3] * v[3] + v[0], bp[i*3+1] * v[4] + v[1], bp[i*3+2] * v[5] + v[2]);
+      N.push(bn[i*3], bn[i*3+1], bn[i*3+2]); C.push(col.r, col.g, col.b);
+    }
+    for(let i = 0; i < bi.length; i++) I.push(bi[i] + o);
+    o += 24;
+  });
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(P, 3));
+  g.setAttribute('normal', new THREE.Float32BufferAttribute(N, 3));
+  g.setAttribute('color', new THREE.Float32BufferAttribute(C, 3));
+  g.setIndex(I);
+  const m = new THREE.Mesh(g, new THREE.MeshLambertMaterial({ vertexColors:true, flatShading:true }));
+  m.frustumCulled = false; return m;
+}
+const _rnd = (a, b) => { const x = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return x - Math.floor(x); };
+const HAIR_COLS = [0x120e13, 0x1a151b, 0x0d0a0e, 0x241d27, 0x0a080c, 0x2e2a3a];
+
+// Cabeza realista mirando hacia -z: craneo suave de ~2000 triangulos con relieve (nariz, labios, cejas, pomulos, cuencas)
+// y la CARA PINTADA en una textura (ojos con iris/brillo/pestanas, cejas, labios, rubor, sombras). Cabello de rizos reales.
+function drawPassengerFace(closed){
+  const W = 1024, H = 1024, rx = 0.080, ry = 0.106;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const g = cv.getContext('2d');
+  g.translate(W / 2, H / 2); g.scale(W / (2 * rx), -H / (2 * ry));            // se dibuja en METROS (y hacia arriba)
+  g.fillStyle = '#d9955f'; g.fillRect(-rx, -ry, 2 * rx, 2 * ry);
+  const soft = (x, y, ax, ay, rgb, a) => {
+    g.save(); g.translate(x, y); g.scale(1, ay / ax);
+    const gr = g.createRadialGradient(0, 0, 0, 0, 0, ax); gr.addColorStop(0, 'rgba(' + rgb + ',' + a + ')'); gr.addColorStop(1, 'rgba(' + rgb + ',0)');
+    g.fillStyle = gr; g.beginPath(); g.arc(0, 0, ax, 0, 7); g.fill(); g.restore();
+  };
+  soft(0, 0.035, 0.05, 0.03, '255,222,185', 0.20);                              // luz en la frente
+  soft(0, -0.097, 0.020, 0.010, '255,215,175', 0.18);                           // menton
+  [-1, 1].forEach(k => {
+    soft(k * 0.072, 0.0, 0.020, 0.070, '95,45,28', 0.28);                       // sombra de las sienes
+    soft(k * 0.034, 0.014, 0.030, 0.020, '120,62,42', 0.32);                    // cuenca del ojo
+    soft(k * 0.034, -0.010, 0.028, 0.008, '150,80,60', 0.22);                   // ojera suave
+    soft(k * 0.053, -0.030, 0.030, 0.021, '228,105,85', 0.40);                  // rubor
+    soft(k * 0.018, -0.022, 0.010, 0.030, '110,55,35', 0.28);                   // sombra lateral de la nariz
+    soft(k * 0.011, -0.046, 0.0065, 0.0042, '35,12,8', 0.85);                   // fosa nasal
+    soft(k * 0.034, 0.026, 0.028, 0.013, '150,88,66', 0.32);                    // sombra de ojos
+    soft(k * 0.050, -0.006, 0.020, 0.011, '255,232,200', 0.30);                 // iluminador en el pomulo
+  });
+  soft(0, -0.036, 0.012, 0.010, '255,218,172', 0.42);                           // brillo de la punta de la nariz
+  soft(0, -0.083, 0.021, 0.008, '120,50,45', 0.34);                             // sombra bajo el labio
+  [-1, 1].forEach(k => {
+    const ex = k * 0.034, ey = 0.008;
+    if(!closed){
+      const eye = () => { g.beginPath(); g.moveTo(ex - 0.0158, ey - 0.0006); g.quadraticCurveTo(ex, ey + 0.0108, ex + 0.0158, ey - 0.0006); g.quadraticCurveTo(ex, ey - 0.0086, ex - 0.0158, ey - 0.0006); g.closePath(); };
+      g.save(); eye(); g.fillStyle = '#eee8e0'; g.fill(); g.clip();
+      const ir = g.createRadialGradient(ex, ey, 0.0005, ex, ey, 0.0074); ir.addColorStop(0, '#86532d'); ir.addColorStop(0.6, '#4a2a17'); ir.addColorStop(1, '#1d0f08');
+      g.fillStyle = ir; g.beginPath(); g.arc(ex, ey + 0.0003, 0.0074, 0, 7); g.fill();
+      g.fillStyle = '#040202'; g.beginPath(); g.arc(ex, ey + 0.0003, 0.0031, 0, 7); g.fill();
+      g.fillStyle = 'rgba(255,255,255,0.95)'; g.beginPath(); g.arc(ex + 0.0022, ey + 0.0036, 0.0016, 0, 7); g.fill();
+      g.fillStyle = 'rgba(255,255,255,0.45)'; g.beginPath(); g.arc(ex - 0.0024, ey - 0.0024, 0.0009, 0, 7); g.fill();
+      const sh = g.createLinearGradient(0, ey + 0.009, 0, ey); sh.addColorStop(0, 'rgba(20,8,6,0.65)'); sh.addColorStop(1, 'rgba(20,8,6,0)');
+      g.fillStyle = sh; g.fillRect(ex - 0.02, ey, 0.04, 0.012);
+      g.restore();
+      g.strokeStyle = '#0b0606'; g.lineWidth = 0.0019; g.lineCap = 'round';
+      g.beginPath(); g.moveTo(ex - 0.0158, ey - 0.0006); g.quadraticCurveTo(ex, ey + 0.0108, ex + 0.0158, ey - 0.0006); g.stroke();
+      g.lineWidth = 0.0012; g.beginPath(); g.moveTo(ex + k * 0.0150, ey); g.lineTo(ex + k * 0.0198, ey + 0.0036); g.stroke();       // pestana exterior
+      g.lineWidth = 0.0008; g.strokeStyle = 'rgba(120,58,44,0.75)';
+      g.beginPath(); g.moveTo(ex - 0.0158, ey - 0.0006); g.quadraticCurveTo(ex, ey - 0.0086, ex + 0.0158, ey - 0.0006); g.stroke();  // parpado inferior
+      g.strokeStyle = 'rgba(105,52,32,0.55)';
+      g.beginPath(); g.moveTo(ex - 0.014, ey + 0.0078); g.quadraticCurveTo(ex, ey + 0.0142, ex + 0.014, ey + 0.0078); g.stroke();       // pliegue del parpado
+    } else {
+      g.fillStyle = '#cf8a5a'; g.beginPath(); g.moveTo(ex - 0.0165, ey); g.quadraticCurveTo(ex, ey + 0.0120, ex + 0.0165, ey); g.quadraticCurveTo(ex, ey - 0.0075, ex - 0.0165, ey); g.fill();
+      g.strokeStyle = '#0b0606'; g.lineWidth = 0.0020; g.lineCap = 'round';
+      g.beginPath(); g.moveTo(ex - 0.0158, ey); g.quadraticCurveTo(ex, ey - 0.0070, ex + 0.0158, ey); g.stroke();
+      g.lineWidth = 0.0009; for(let i = 0; i < 6; i++){ const x = ex - 0.012 + i * 0.0048, y = ey - 0.0052 * Math.sin((i + 0.5) / 6 * Math.PI); g.beginPath(); g.moveTo(x, y); g.lineTo(x + k * 0.0012, y - 0.0030); g.stroke(); }
+    }
+    // ceja: forma arqueada + trazos de vello
+    g.fillStyle = 'rgba(22,13,10,0.92)'; g.beginPath(); g.moveTo(k * 0.016, 0.0355); g.quadraticCurveTo(k * 0.036, 0.0500, k * 0.064, 0.0405);
+    g.quadraticCurveTo(k * 0.036, 0.0435, k * 0.016, 0.0318); g.closePath(); g.fill();
+    g.strokeStyle = 'rgba(15,9,7,0.7)'; g.lineWidth = 0.0007;
+    for(let i = 0; i < 16; i++){ const t = i / 15, x = k * (0.016 + 0.048 * t), y = 0.0335 + 0.0125 * Math.sin(Math.PI * Math.pow(t, 0.8)) + 0.0025 * t; g.beginPath(); g.moveTo(x, y); g.lineTo(x + k * 0.0032, y + 0.0022); g.stroke(); }
+  });
+  // labios: arco de cupido, labio inferior con brillo y linea de la boca
+  g.fillStyle = '#b04d4c'; g.beginPath(); g.moveTo(-0.019, -0.0685); g.bezierCurveTo(-0.014, -0.0605, -0.008, -0.0585, -0.0045, -0.0595); g.lineTo(0, -0.0612); g.lineTo(0.0045, -0.0595);
+  g.bezierCurveTo(0.008, -0.0585, 0.014, -0.0605, 0.019, -0.0685); g.quadraticCurveTo(0, -0.0715, -0.019, -0.0685); g.closePath(); g.fill();
+  g.fillStyle = '#c96b64'; g.beginPath(); g.moveTo(-0.018, -0.0692); g.quadraticCurveTo(0, -0.0715, 0.018, -0.0692); g.bezierCurveTo(0.014, -0.0815, -0.014, -0.0815, -0.018, -0.0692); g.fill();
+  soft(0, -0.0752, 0.010, 0.0032, '255,205,195', 0.38);
+  g.strokeStyle = '#5a221f'; g.lineWidth = 0.0009; g.beginPath(); g.moveTo(-0.019, -0.0685); g.quadraticCurveTo(0, -0.0715, 0.019, -0.0685); g.stroke();
+  return cv;
+}
+function buildPassengerHead(){
+  const rx = 0.080, ry = 0.106, rz = 0.090;
+  const sstep = (a, b, x) => { const t = Math.max(0, Math.min(1, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+  const hairAmt = (x, y, z) => Math.max(sstep(0.048, 0.072, y), sstep(0.0, 0.030, z), sstep(0.046, 0.062, Math.abs(x)) * sstep(-0.02, 0.005, y) * sstep(-0.05, -0.025, z));
+  const bump = (x, y, cx, cy, ax, ay, h) => h * Math.exp(-(((x - cx) / ax) ** 2 + ((y - cy) / ay) ** 2));
+  let geo = new THREE.IcosahedronGeometry(1, 9); if(geo.index) geo = geo.toNonIndexed();
+  const pa = geo.attributes.position, n = pa.count, UV = new Float32Array(n * 2), C = new Float32Array(n * 3), col = new THREE.Color();
+  for(let i = 0; i < n; i++){
+    let x = pa.getX(i) * rx, y = pa.getY(i) * ry, z = pa.getZ(i) * rz;
+    if(y < -0.03){ const t = Math.min(1, (-0.03 - y) / 0.076); x *= 1 - 0.32 * Math.pow(t, 1.2); }          // mandibula y menton
+    if(z < 0){
+      let d = bump(x, y, 0, -0.030, 0.014, 0.020, 0.015) + bump(x, y, 0, 0.004, 0.008, 0.032, 0.007)          // punta y puente de la nariz
+            + bump(x, y, -0.014, -0.040, 0.008, 0.008, 0.005) + bump(x, y, 0.014, -0.040, 0.008, 0.008, 0.005)   // alas de la nariz
+            + bump(x, y, 0, -0.0655, 0.022, 0.0075, 0.0055) + bump(x, y, 0, -0.0745, 0.018, 0.0075, 0.0050)     // labios
+            + bump(x, y, 0, -0.097, 0.020, 0.012, 0.0035)                                                       // menton
+            + bump(x, y, -0.05, -0.020, 0.020, 0.016, 0.0040) + bump(x, y, 0.05, -0.020, 0.020, 0.016, 0.0040)  // pomulos
+            + bump(x, y, -0.035, 0.032, 0.030, 0.008, 0.0040) + bump(x, y, 0.035, 0.032, 0.030, 0.008, 0.0040)  // arco de las cejas
+            - bump(x, y, -0.034, 0.010, 0.022, 0.012, 0.0035) - bump(x, y, 0.034, 0.010, 0.022, 0.012, 0.0035); // cuencas de los ojos
+      z -= d;
+    }
+    pa.setXYZ(i, x, y, z);
+    UV[i * 2] = x / (2 * rx) + 0.5; UV[i * 2 + 1] = y / (2 * ry) + 0.5;
+  }
+  for(let f = 0; f < n; f += 3){                                                                                // piel / pelo suave por vertice
+    for(let k = 0; k < 3; k++){
+      const h = hairAmt(pa.getX(f + k), pa.getY(f + k), pa.getZ(f + k));
+      col.setRGB(1 - 0.88 * h, 1 - 0.90 * h, 1 - 0.89 * h);
+      C[(f + k) * 3] = col.r; C[(f + k) * 3 + 1] = col.g; C[(f + k) * 3 + 2] = col.b;
+    }
+  }
+  geo.setAttribute('uv', new THREE.BufferAttribute(UV, 2)); geo.setAttribute('color', new THREE.BufferAttribute(C, 3));
+  smoothNormals(geo);
+  const texOpen = new THREE.CanvasTexture(drawPassengerFace(false)), texClosed = new THREE.CanvasTexture(drawPassengerFace(true));
+  texOpen.anisotropy = texClosed.anisotropy = 8;
+  const skull = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({ map:texOpen, vertexColors:true, specular:0x2a1c14, shininess:14 }));
+  skull.frustumCulled = false;
+
+  // Rizos alrededor de la cabeza (nunca sobre la cara)
+  const HC = [0x120d10, 0x18121a, 0x0d090c, 0x241c28, 0x0a070a, 0x2c2434], locks = [];
+  for(let ai = 0; ai < 26; ai++) for(let ei = 0; ei < 9; ei++){
+    const az = ai * (Math.PI * 2 / 26) + _rnd(ai, ei) * 0.1, el = -0.15 + ei * 0.20;
+    const ux = Math.cos(el) * Math.sin(az), uy = Math.sin(el), uz = Math.cos(el) * Math.cos(az);          // az=0 -> atras (+z)
+    const S = [ux * rx * 0.97, uy * ry * 0.97, uz * rz * 0.97];
+    if(hairAmt(S[0], S[1], S[2]) < 0.55 || S[1] < -0.045 || _rnd(ai + 7, ei) < 0.14 || (S[2] < -0.004 && S[1] < 0.062)) continue;
+    const nl = Math.hypot(ux / rx, uy / ry, uz / rz), nx = ux / rx / nl, ny = uy / ry / nl, nz = uz / rz / nl;
+    const len = 0.060 + _rnd(ai, ei + 3) * 0.045, front = S[2] < -0.03, drop = front ? 0 : 0.03 + _rnd(ei, ai) * 0.05;
+    locks.push({ S, E:[S[0] + nx * len, S[1] + ny * len - drop + (front ? 0.02 : 0), S[2] + nz * len], B:[nx * 0.018, ny * 0.018, nz * 0.018],
+      curl:0.010 + _rnd(ai, ei + 5) * 0.006, turns:2 + _rnd(ei, ai + 2) * 1.5, phase:_rnd(ai, ei) * 6.28, r0:0.0105, r1:0.0065, col:HC[(ai + ei * 3) % HC.length] });
+  }
+  const grp = new THREE.Group(); grp.frustumCulled = false;
+  // Casquete de cabello: cubre todo el cuero cabelludo (menos la cara); las rastas nacen de aqui.
+  const cs = new THREE.IcosahedronGeometry(1, 5).toNonIndexed(), cp = cs.attributes.position, capP = [], capC = [], cc0 = new THREE.Color();
+  for(let f = 0; f < cp.count; f += 3){
+    let mx = 0, my = 0, mz = 0; for(let k = 0; k < 3; k++){ mx += cp.getX(f + k) * rx; my += cp.getY(f + k) * ry; mz += cp.getZ(f + k) * rz; } mx /= 3; my /= 3; mz /= 3;
+    if(hairAmt(mx, my, mz) < 0.62 || my < -0.07 || (mz < -0.02 && my < 0.062)) continue;
+    for(let k = 0; k < 3; k++){
+      const ux = cp.getX(f + k), uy = cp.getY(f + k), uz = cp.getZ(f + k), az = Math.atan2(ux, uz);
+      capP.push(ux * rx * 1.06, uy * ry * 1.05, uz * rz * 1.07);
+      cc0.set(0x150e0c).multiplyScalar(0.55 + 0.75 * Math.pow(Math.abs(Math.sin(az * 26 + uy * 9)), 0.8)); capC.push(cc0.r, cc0.g, cc0.b);
+    }
+  }
+  const capG = new THREE.BufferGeometry(); capG.setAttribute('position', new THREE.Float32BufferAttribute(capP, 3)); capG.setAttribute('color', new THREE.Float32BufferAttribute(capC, 3)); smoothNormals(capG);
+  const capM = new THREE.Mesh(capG, new THREE.MeshPhongMaterial({ vertexColors:true, specular:0x30283a, shininess:22 })); capM.frustumCulled = false;
+  grp.add(skull); grp.add(capM);
+  let closedNow = false;
+  grp.userData.setBlink = b => { if(b !== closedNow){ closedNow = b; skull.material.map = b ? texClosed : texOpen; } };
+  return grp;
+}
+// Rastas largas con cuentas y FISICA real: cada mechon es una cadena de nodos (Verlet) anclada a la cabeza.
+// Reaccionan a: giro de la cabeza, curvas (fuerza centrifuga), acelerar/frenar, baches y brisa. Chocan con cabeza, cuello, hombros, torso y asiento.
+// Ajusta aqui: HAIR_CFG (cantidad, largo, grosor, rigidez, amortiguacion, sensibilidad al movimiento).
+const HAIR_CFG = { len:[0.42, 0.70], rad:[0.0115, 0.0150], nodes:14, stiff:0.07, damp:0.982, gravity:9, gyro:1.0, sway:1.0 };
+function buildPassengerHair(){
+  const rx = 0.080, ry = 0.106, rz = 0.090, M = HAIR_CFG.nodes, SIDES = 6, RAD = 0.012;
+  const ROWS = [-0.42, -0.14, 0.12, 0.38, 0.62, 0.84, 1.04, 1.20, 1.34, 1.46], COLS = [40, 44, 46, 44, 40, 34, 26, 18, 10, 4];   // ~300 rastas
+  const HC = [0x150e0d, 0x1b1311, 0x100a0a, 0x241812, 0x2d1c14, 0x0d0908], locs = [];
+  ROWS.forEach((el, ri) => {
+    for(let ci = 0; ci < COLS[ri]; ci++){
+      const az = ((ci + 0.5 + (_rnd(ri, ci) - 0.5) * 0.5) / COLS[ri] * 2 - 1) * Math.PI * 0.985;
+      const ce = Math.cos(el), x = Math.sin(az) * ce * rx * 0.96, y = Math.sin(el) * ry * 0.96, z = -Math.cos(az) * ce * rz * 0.96;
+      if(z < -0.02 && (y < 0.06 || Math.abs(x) < 0.04)) continue;   // nunca sobre la cara
+      if(z < -0.02 && Math.abs(x) < 0.007) continue;       // raya al medio
+      const n = z < 0.02 ? new THREE.Vector3((x < 0 ? -1 : 1) * 0.8, 0.10, 0.60).normalize() : new THREE.Vector3(x / (rx * rx), y / (ry * ry), z / (rz * rz)).normalize();   // las del frente se van hacia los lados
+      const len = HAIR_CFG.len[0] + _rnd(ri + 3, ci) * (HAIR_CFG.len[1] - HAIR_CFG.len[0]);
+      locs.push({ root:new THREE.Vector3(x, y, z), n, len:len * (ri === 0 ? 0.8 : 1), ph:_rnd(ci, ri + 9) * 6.28,
+        rad:HAIR_CFG.rad[0] + _rnd(ri, ci + 4) * (HAIR_CFG.rad[1] - HAIR_CFG.rad[0]), col:HC[(ri * 3 + ci) % HC.length] });
+    }
+  });
+  const N = locs.length, P = new Float32Array(N * M * 3), Q = new Float32Array(N * M * 3), R = new Float32Array(N * 3), RN = new Float32Array(N * 3);
+  const pos = new Float32Array(N * M * SIDES * 3), nor = new Float32Array(N * M * SIDES * 3), colA = new Float32Array(N * M * SIDES * 3), idx = [], cc = new THREE.Color();
+  locs.forEach((L, l) => {
+    for(let i = 0; i < M; i++) for(let k = 0; k < SIDES; k++){
+      cc.set(L.col).multiplyScalar(0.80 + 0.30 * Math.sin(i * 2.3 + k * Math.PI * 2 / SIDES + L.ph));   // espiral: efecto de rasta trenzada
+      const o = ((l * M + i) * SIDES + k) * 3; colA[o] = cc.r; colA[o + 1] = cc.g; colA[o + 2] = cc.b;
+    }
+    for(let i = 0; i < M - 1; i++) for(let k = 0; k < SIDES; k++){
+      const a = (l * M + i) * SIDES + k, b = (l * M + i) * SIDES + (k + 1) % SIDES, c = (l * M + i + 1) * SIDES + k, d = (l * M + i + 1) * SIDES + (k + 1) % SIDES;
+      idx.push(a, c, b, b, c, d);
+    }
+  });
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3).setUsage(THREE.DynamicDrawUsage));
+  geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3).setUsage(THREE.DynamicDrawUsage));
+  geo.setAttribute('color', new THREE.BufferAttribute(colA, 3)); geo.setIndex(idx);
+  const mesh = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({ vertexColors:true, specular:0x3a3040, shininess:20, side:THREE.DoubleSide }));
+  mesh.frustumCulled = false;
+
+  // Cuentas de colores en algunas rastas (siguen al mechon)
+  const beadLoc = [], BC = [0xd4a72c, 0xb0603a, 0xe8dcc0, 0x6b3a22, 0xd4a72c, 0xc47a3c];
+  for(let l = 0; l < N; l += 3) beadLoc.push([l, 5 + Math.floor(_rnd(l, 2) * 8)]);
+  const beads = new THREE.InstancedMesh(new THREE.SphereGeometry(0.0155, 8, 6), new THREE.MeshPhongMaterial({ color:0xffffff, specular:0xffffff, shininess:70 }), beadLoc.length);
+  beads.frustumCulled = false; beadLoc.forEach((b, i) => beads.setColorAt(i, cc.set(BC[i % BC.length])));
+  if(beads.instanceColor) beads.instanceColor.needsUpdate = true;
+
+  const g = new THREE.Group(); g.frustumCulled = false; g.add(mesh); g.add(beads);
+  const RG = [[0, .15, .10], [.10, .165, .11], [.145, .168, .113], [.165, .148, .098], [.27, .142, .094], [.36, .172, .104], [.44, .19, .102], [.50, .165, .088], [.535, .075, .07], [.565, .07, .066]];
+  let W = 0, D = 0; const bodyWD = y => { for(let i = 0; i < RG.length - 1; i++) if(y <= RG[i + 1][0]){ const u = (y - RG[i][0]) / (RG[i + 1][0] - RG[i][0]); W = RG[i][1] + (RG[i + 1][1] - RG[i][1]) * u; D = RG[i][2] + (RG[i + 1][2] - RG[i][2]) * u; return; } };
+  const inv = new THREE.Matrix4(), tv = new THREE.Vector3(), dm = new THREE.Object3D();
+  const th = PASSENGER.bodyYaw, cy = Math.cos(th), sy = Math.sin(th);
+  const H = { ready:false, ls:0, acc:0, brz:0, aq:0, act:0, rest:1, rp:false }, RP = new Float32Array(48);
+
+  function collide(k, near, M4){
+    let x = P[k], y = P[k + 1], z = P[k + 2];
+    if(y > 0.0 && y < 0.565){ bodyWD(y); const dx = x / (W + RAD), dz = z / (D + RAD), e = dx * dx + dz * dz;
+      if(e < 1){ if(e > 1e-6){ const s = 1 / Math.sqrt(e); x *= s; z *= s; } else z = -(D + RAD); } }
+    else if(y >= 0.565 && y < 0.66){ const dz = z + 0.007, d2 = x * x + dz * dz; if(d2 < 0.0026 && d2 > 1e-8){ const s = 0.051 / Math.sqrt(d2); x *= s; z = dz * s - 0.007; } }
+    for(let sd = -1; sd <= 1; sd += 2){ const cx = sd * 0.19, ex = (x - cx) / (0.09 + RAD), ey = (y - 0.49) / (0.07 + RAD), ez = z / (0.10 + RAD), e = ex * ex + ey * ey + ez * ez;
+      if(e < 1 && e > 1e-6){ const s = 1 / Math.sqrt(e); x = cx + (x - cx) * s; y = 0.49 + (y - 0.49) * s; z *= s; } }
+    const yp = y + 0.45; let xp = x * cy + z * sy, zp = -x * sy + z * cy;                 // a coordenadas del asiento
+    if(yp > 0.41 && yp < 1.07 && Math.abs(xp) < 0.36){ const lim = 0.20 + (yp - 0.74) * 0.14; if(zp > lim){ zp = lim; x = xp * cy - zp * sy; z = xp * sy + zp * cy; } }
+    else if(yp >= 1.07 && yp < 1.26 && Math.abs(xp) < 0.15 && zp > 0.29){ zp = 0.29; x = xp * cy - zp * sy; z = xp * sy + zp * cy; }
+    if(near){ tv.set(x, y, z).applyMatrix4(inv); const ex = tv.x / (rx + RAD), ey = tv.y / (ry + RAD), ez = tv.z / (rz + RAD), e = ex * ex + ey * ey + ez * ez;
+      if(e < 1 && e > 1e-6){ tv.multiplyScalar(1 / Math.sqrt(e)); }
+      if(tv.z < 0.0 && tv.y < 0.08 && tv.y > -0.13 && Math.abs(tv.x) < 0.10) tv.x = (tv.x < 0 ? -1 : 1) * 0.10;   // zona de la cara: el pelo cae por los lados, nunca delante
+      tv.applyMatrix4(M4); x = tv.x; y = tv.y; z = tv.z; }
+    P[k] = x; P[k + 1] = y; P[k + 2] = z;
+  }
+  function step(h, fx, fy, fz, t, M4){
+    const dmp = Math.pow(HAIR_CFG.damp, h * 60) * (1 - 0.97 * H.rest), gy = -HAIR_CFG.gravity;   // en reposo se mata la velocidad: nada tiembla
+    for(let l = 0; l < N; l++){
+      const b = l * M * 3, rx0 = R[l * 3], ry0 = R[l * 3 + 1], rz0 = R[l * 3 + 2], L = locs[l], seg = L.len / (M - 1);
+      P[b] = Q[b] = rx0; P[b + 1] = Q[b + 1] = ry0; P[b + 2] = Q[b + 2] = rz0;
+      const br = Math.sin(t * 1.7 + L.ph) * 0.35 * HAIR_CFG.sway * H.brz;   // brisa solo si el auto se mueve
+      for(let i = 1; i < M; i++){
+        const k = b + i * 3, w = br * (0.5 + i / M);
+        for(let c = 0; c < 3; c++){ const p = P[k + c], v = (p - Q[k + c]) * dmp; Q[k + c] = p; const a = c === 0 ? fx + w : c === 1 ? gy + fy : fz + w * 0.6; P[k + c] = p + v + a * h * h; }
+      }
+      // rigidez: sale de la cabeza hacia afuera y luego cae en curva suave (como una rasta pesada)
+      const nx = RN[l * 3], ny = RN[l * 3 + 1], nz = RN[l * 3 + 2];
+      P[b + 3] += (rx0 + nx * seg - P[b + 3]) * 0.22; P[b + 4] += (ry0 + ny * seg - P[b + 4]) * 0.22; P[b + 5] += (rz0 + nz * seg - P[b + 5]) * 0.22;
+      for(let i = 2; i < M; i++){ const k = b + i * 3, s = HAIR_CFG.stiff; for(let c = 0; c < 3; c++) P[k + c] += (2 * P[k - 3 + c] - P[k - 6 + c] - P[k + c]) * s; }
+      for(let it = 0; it < 5; it++) for(let i = 1; i < M; i++){
+        const a = b + (i - 1) * 3, k = b + i * 3, dx = P[k] - P[a], dy = P[k + 1] - P[a + 1], dz = P[k + 2] - P[a + 2], d = Math.hypot(dx, dy, dz) || 1e-6, df = (d - seg) / d, wa = i === 1 ? 0 : 0.5, wb = i === 1 ? 1 : 0.5;
+        P[k] -= dx * df * wb; P[k + 1] -= dy * df * wb; P[k + 2] -= dz * df * wb; P[a] += dx * df * wa; P[a + 1] += dy * df * wa; P[a + 2] += dz * df * wa;
+      }
+      for(let i = 1; i < M; i++) collide(b + i * 3, i < 10, M4);
+    }
+  }
+  function update(C, t, st, dt){
+    const head = C.head; head.updateMatrix(); const M4 = head.matrix; inv.copy(M4).invert();
+    for(let l = 0; l < N; l++){ tv.copy(locs[l].root).applyMatrix4(M4); R[l * 3] = tv.x; R[l * 3 + 1] = tv.y; R[l * 3 + 2] = tv.z;
+      tv.copy(locs[l].n).transformDirection(M4); RN[l * 3] = tv.x; RN[l * 3 + 1] = tv.y; RN[l * 3 + 2] = tv.z; }
+    if(!H.ready){                                  // pose inicial: cuelgan y se asientan sobre el cuerpo
+      H.ready = true;
+      for(let l = 0; l < N; l++){ const seg = locs[l].len / (M - 1); for(let i = 0; i < M; i++){ const k = (l * M + i) * 3, o = Math.min(i, 3) * seg * 0.6;
+        P[k] = Q[k] = R[l * 3] + RN[l * 3] * o; P[k + 1] = Q[k + 1] = R[l * 3 + 1] + RN[l * 3 + 1] * o - seg * i * 0.9; P[k + 2] = Q[k + 2] = R[l * 3 + 2] + RN[l * 3 + 2] * o; } }
+      for(let s = 0; s < 260; s++) step(1 / 60, 0, 0, 0, 0, M4);
+    }
+    const speed = (typeof carState !== 'undefined' && carState.speed) || 0, spdN = clamp(Math.abs(speed) / 45, 0, 1);
+    H.acc += ((speed - H.ls) / dt - H.acc) * Math.min(1, dt * 5); H.ls = speed;
+    let rv = 0; if(H.rp){ for(let l = 0; l < 16; l++) rv += Math.hypot(R[l * 3] - RP[l * 3], R[l * 3 + 1] - RP[l * 3 + 1], R[l * 3 + 2] - RP[l * 3 + 2]); rv /= 16 * dt; }
+    for(let l = 0; l < 16; l++){ RP[l * 3] = R[l * 3]; RP[l * 3 + 1] = R[l * 3 + 1]; RP[l * 3 + 2] = R[l * 3 + 2]; } H.rp = true;
+    const tgt = Math.max(clamp((rv - 0.012) / 0.04, 0, 1), (Math.abs(speed) > 0.5 || Math.abs(H.acc) > 0.6) ? 1 : 0);   // hay movimiento real? (giro de cabeza, auto)
+    H.act += (tgt - H.act) * Math.min(1, dt * (tgt > H.act ? 14 : 1.5)); H.rest = 1 - H.act;
+    const fzC = clamp(H.acc * 0.18, -4, 4) * HAIR_CFG.gyro, fxC = -st * spdN * 7 * HAIR_CFG.gyro;      // acelerar -> pelo hacia atras; curva -> pelo hacia afuera
+    const fx = fxC * cy - fzC * sy, fz = fxC * sy + fzC * cy, fy = Math.sin(t * 19) * Math.sin(t * 7.3) * spdN * 3.0;   // baches
+    H.brz = spdN * 0.9; H.aq += dt; let ns = 0;      // paso fijo: en reposo el pelo se asienta y se queda quieto
+    while(H.aq >= 1 / 120 && ns < 5){ step(1 / 120, fx, fy, fz, t, M4); H.aq -= 1 / 120; ns++; } if(ns >= 5) H.aq = 0;
+    // malla de tubos (marco transportado en paralelo)
+    for(let l = 0; l < N; l++){
+      const b = l * M * 3, L = locs[l]; let ux = 0, uy = 0, uz = 0, first = true;
+      for(let i = 0; i < M; i++){
+        const a = b + Math.max(0, i - 1) * 3, c = b + Math.min(M - 1, i + 1) * 3;
+        let tx = P[c] - P[a], ty = P[c + 1] - P[a + 1], tz = P[c + 2] - P[a + 2]; const tl = Math.hypot(tx, ty, tz) || 1; tx /= tl; ty /= tl; tz /= tl;
+        if(first){ ux = ty * 1 - tz * 0; uy = tz * 0 - tx * 1; uz = 0; if(Math.hypot(ux, uy, uz) < 1e-4){ ux = 1; uy = 0; uz = 0; } first = false; }   // T x (0,0,1)
+        const dp = ux * tx + uy * ty + uz * tz; ux -= tx * dp; uy -= ty * dp; uz -= tz * dp; const ul = Math.hypot(ux, uy, uz) || 1; ux /= ul; uy /= ul; uz /= ul;
+        const vx = ty * uz - tz * uy, vy = tz * ux - tx * uz, vz = tx * uy - ty * ux, tt = i / (M - 1);
+        const r = L.rad * (1 - 0.32 * tt) * (1 + 0.10 * Math.sin(i * 2.7 + L.ph)) * (i === M - 1 ? 0.5 : 1), k3 = b + i * 3;
+        for(let k = 0; k < SIDES; k++){
+          const an = k / SIDES * Math.PI * 2, ca = Math.cos(an), sa = Math.sin(an), o = ((l * M + i) * SIDES + k) * 3;
+          const nx = ux * ca + vx * sa, ny = uy * ca + vy * sa, nz = uz * ca + vz * sa;
+          pos[o] = P[k3] + nx * r; pos[o + 1] = P[k3 + 1] + ny * r; pos[o + 2] = P[k3 + 2] + nz * r; nor[o] = nx; nor[o + 1] = ny; nor[o + 2] = nz;
+        }
+      }
+    }
+    geo.attributes.position.needsUpdate = true; geo.attributes.normal.needsUpdate = true;
+    beadLoc.forEach(([l, i], bi) => { const k = (l * M + i) * 3; dm.position.set(P[k], P[k + 1], P[k + 2]); dm.scale.set(1, 0.85, 1); dm.updateMatrix(); beads.setMatrixAt(bi, dm.matrix); });
+    beads.instanceMatrix.needsUpdate = true;
+  }
+  g.userData.mesh = mesh; g.userData.sim = { update };
+  return g;
+}
+function animatePassengerHair(C, t, yaw, st){
+  const S = C.hair && C.hair.userData.sim; if(!S) return;
+  const dt = Math.min(0.033, Math.max(0.004, C.hT === undefined ? 0.016 : t - C.hT)); C.hT = t;
+  S.update(C, t, st, dt);
+}
+// Cinturon de seguridad: cinta plana pegada al torso (de hombro a cadera opuesta) que se pierde por el costado, con hebilla. Sin "pilar".
+function buildSeatbelt(R){
+  const at = y => { for(let i = 0; i < R.length - 1; i++) if(y >= R[i][0] && y <= R[i + 1][0]){ const u = (y - R[i][0]) / (R[i + 1][0] - R[i][0]); return [R[i][1] + (R[i + 1][1] - R[i][1]) * u, R[i][2] + (R[i + 1][2] - R[i][2]) * u]; } return [R[R.length - 1][1], R[R.length - 1][2]]; };
+  const n = 18, P = [], I = [], pts = [], nor = [];
+  for(let i = 0; i <= n; i++){
+    const u = i / n, y = 0.50 - 0.40 * u, wd = at(y), w = wd[0], d = wd[1], xc = Math.max(-w * 0.985, Math.min(w * 0.985, 0.13 - 0.30 * u)), z = -d * Math.sqrt(1 - (xc / w) * (xc / w));
+    const nx = xc / (w * w), nz = z / (d * d), nl = Math.hypot(nx, nz) || 1;
+    nor.push(new THREE.Vector3(nx / nl, 0, nz / nl)); pts.push(new THREE.Vector3(xc + nx / nl * 0.005, y, z + nz / nl * 0.005));
+  }
+  for(let i = 0; i <= n; i++){
+    const T = pts[Math.min(n, i + 1)].clone().sub(pts[Math.max(0, i - 1)]).normalize(), W = new THREE.Vector3().crossVectors(T, nor[i]).normalize().multiplyScalar(0.017);
+    P.push(pts[i].x - W.x, pts[i].y - W.y, pts[i].z - W.z, pts[i].x + W.x, pts[i].y + W.y, pts[i].z + W.z);
+    if(i < n){ const a = i * 2; I.push(a, a + 1, a + 2, a + 1, a + 3, a + 2); }
+  }
+  const geo = new THREE.BufferGeometry(); geo.setAttribute('position', new THREE.Float32BufferAttribute(P, 3)); geo.setIndex(I); geo.computeVertexNormals();
+  const grp = new THREE.Group(), belt = new THREE.Mesh(geo, new THREE.MeshPhongMaterial({ color:0x16191e, specular:0x30343c, shininess:30, side:THREE.DoubleSide }));
+  belt.frustumCulled = false; grp.add(belt);
+  const e = pts[n]; grp.add(blobMesh(new THREE.MeshPhongMaterial({ color:0xb8bec6, specular:0xffffff, shininess:70 }), 0.032, 0.05, 0.016, e.x, e.y, e.z, 0));
+  return grp;
+}
+
+// Mano relajada: palma suave, dedos de 3 falanges con curva natural, pulgar de 2 segmentos y unas pintadas.
+function buildPassengerHand(skinHex, side){
+  const g = new THREE.Group(), m = new THREE.MeshPhongMaterial({ color:skinHex, specular:0x33221a, shininess:20 });
+  const nail = new THREE.MeshPhongMaterial({ color:0x8d1c33, specular:0xffffff, shininess:90 }), V = (x, y, z) => new THREE.Vector3(x, y, z);
+  g.add(blobMesh(m, 0.078, 0.030, 0.090, 0, 0, 0.004, 1)); g.add(blobMesh(m, 0.066, 0.024, 0.040, 0, -0.001, -0.038, 1)); g.add(blobMesh(m, 0.050, 0.026, 0.036, 0, 0, 0.050, 1));
+  const seg = (a, b, t) => { const s = limbMesh(m); g.add(s); setLimb(s, a, b, t); };
+  const LN = [[0.028, 0.020, 0.016], [0.031, 0.022, 0.017], [0.029, 0.021, 0.016], [0.023, 0.017, 0.014]];
+  for(let i = 0; i < 4; i++){
+    const sp = (i - 1.5) * 0.05 * side, cv = 0.14 + i * 0.04; let P = V((-0.028 + i * 0.019) * side, -0.003, -0.052), pitch = 0.02;
+    for(let j = 0; j < 3; j++){
+      const d = V(Math.sin(sp) * Math.cos(pitch), -Math.sin(pitch), -Math.cos(sp) * Math.cos(pitch)), E = P.clone().addScaledVector(d, LN[i][j]), t = 0.019 - j * 0.0024 - (i === 3 ? 0.002 : 0);
+      seg(P, E, t); g.add(blobMesh(m, t * 1.08, t * 1.08, t * 1.08, E.x, E.y, E.z, 0));
+      if(j === 2) g.add(blobMesh(nail, t * 0.8, 0.004, 0.012, E.x - d.x * 0.008, E.y + 0.006, E.z - d.z * 0.008, 0));
+      P = E; pitch += cv * (1 + j * 0.15);
+    }
+  }
+  const T0 = V(-side * 0.036, -0.004, -0.004), T1 = V(-side * 0.056, -0.009, -0.034), T2 = V(-side * 0.064, -0.014, -0.060);
+  seg(T0, T1, 0.024); g.add(blobMesh(m, 0.026, 0.024, 0.026, T1.x, T1.y, T1.z, 0)); seg(T1, T2, 0.020); g.add(blobMesh(m, 0.021, 0.019, 0.021, T2.x, T2.y, T2.z, 0));
+  g.add(blobMesh(nail, 0.013, 0.004, 0.013, T2.x, T2.y + 0.007, T2.z - 0.003, 0));
+  return g;
+}
+
+// Anillo neon alrededor de un miembro (a->b) en la fraccion f, de radio r.
+function neonRing(parent, a, b, f, r, mat){
+  const d = new THREE.Vector3().subVectors(b, a).normalize(), m = new THREE.Mesh(new THREE.TorusGeometry(r, 0.0032, 6, 24), mat);
+  m.position.copy(a).lerp(b, f); m.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), d); m.frustumCulled = false; parent.add(m); return m;
+}
+function buildCabinPassenger(p, hw, hh){
+  const ud = carGroup.userData;
+  if(p.seatR) p.seatR.visible = false;    // el asiento viejo del copiloto se reemplaza por el nuevo
+  let C = ud.cabin3d;
+  if(!C){
+    C = ud.cabin3d = { key:'' };
+    const g = C.group = new THREE.Group(); g.frustumCulled = false; carGroup.add(g);
+    const P = PASSENGER;
+    const BL = 0x1a1d24, BD = 0x0d0f13, BLT = 0x2a2f3a, NAVY = 0x08090c;   // traje negro futurista
+    const seatMat = cabinLam(0x24262b), seatPad = cabinLam(0x30333a), leather = cabinLam(0x17191d);
+    const blue = cabinLam(BL), blueD = cabinLam(BD), skinM = cabinLam(0xd9955f), dark = cabinLam(0x0b0c0e), navy = cabinLam(NAVY);
+
+    // ----- Panel rojo de la puerta con pantallas, botones y emblema de cristal (adorno, sin escalar) -----
+    const pan = new THREE.Group(); pan.position.y = -0.36; g.add(pan);   // panel BAJO (debajo de la ventana): ya no tapa la vista de la copiloto
+    cabinBox(pan, cabinLam(0xa30f2c), 0.03, 0.66, 1.10, 1.21, -0.04, -0.30);
+    cabinBox(pan, cabinLam(0xc8203f), 0.035, 0.05, 1.10, 1.205, 0.31, -0.30);
+    cabinBox(pan, cabinLam(0x0c0e12), 0.012, 0.14, 0.34, 1.19, 0.05, -0.47);
+    [[-0.545, 0x2fd3c4], [-0.455, 0x3aa8ff], [-0.365, 0x2fd3c4]].forEach(([z, c]) => {
+      cabinBox(pan, new THREE.MeshBasicMaterial({ color:c }), 0.006, 0.10, 0.075, 1.183, 0.05, z + 0.02);
+    });
+    [[0x3dff8a,-0.55],[0xffa030,-0.50],[0x3aa8ff,-0.45],[0xff4a4a,-0.40]].forEach(([c, z]) => {
+      cabinBox(pan, new THREE.MeshBasicMaterial({ color:c }), 0.008, 0.020, 0.030, 1.186, -0.06, z);
+    });
+    const crystal = [];
+    [[0,0.00,0.05,0.14,0xeaf6ff],[0,0.03,0.04,0.11,0xbfe1f8],[0,0.06,0.03,0.08,0xa7d4f2],[0,0.09,0.02,0.05,0x8fc4ea],
+     [-0.05,-0.02,0.03,0.08,0x8fc4ea],[0.05,-0.01,0.03,0.09,0xa7d4f2],[-0.08,-0.03,0.02,0.05,0x6fa8d8],[0.08,-0.03,0.02,0.05,0x6fa8d8]
+    ].forEach(([dz, dy, w, h, c]) => crystal.push([0, dy + h / 2, dz, w, h, w, c]));
+    const cm = voxMesh(crystal); cm.position.set(1.17, -0.02, -0.16); pan.add(cm);
+    cabinBox(pan, cabinLam(0x0c0e12), 0.012, 0.18, 0.20, 1.192, 0.0, -0.16).renderOrder = -1;
+
+    // ----- Todo lo de la copiloto vive en un grupo con origen en el piso, bajo el asiento -----
+    const pg = C.pg = new THREE.Group(); pg.position.set(P.x, P.floorY, P.z); pg.scale.setScalar(P.scale); g.add(pg);
+
+    // Asiento (mira al frente; el respaldo se inclina hacia atras)
+    cabinBox(pg, seatPad, 0.50, 0.10, 0.54, 0, 0.36, -0.02);
+    const back = cabinBox(pg, seatMat, 0.50, 0.66, 0.10, 0, 0.74, 0.27); back.rotation.x = 0.14;
+    [-0.27, 0.27].forEach(dx => { const w = blobMesh(seatPad, 0.10, 0.46, 0.13, dx, 0.70, 0.30, 1); w.rotation.x = 0.14; pg.add(w); });
+    cabinBox(pg, seatMat, 0.26, 0.17, 0.10, 0, 1.16, 0.36);
+    cabinBox(pg, cabinLam(0x14161a), 0.60, 0.05, 0.20, 0, 0.05, 0.05);                    // base / riel
+
+    // Cuerpo: origen en la cadera, frente = -z
+    const rig = C.rig = new THREE.Group(); rig.position.set(0, 0.45, 0); rig.rotation.y = P.bodyYaw; pg.add(rig);
+    // Torso facetado (anillos elipticos de 9 lados): cintura fina, pecho y hombros anchos, hombreras en forma de gema.
+    const RINGS = [[0.00, 0.150, 0.100], [0.10, 0.165, 0.110], [0.145, 0.168, 0.113], [0.165, 0.148, 0.098], [0.27, 0.142, 0.094],
+                   [0.36, 0.172, 0.104], [0.44, 0.190, 0.102], [0.50, 0.165, 0.088], [0.535, 0.075, 0.070], [0.56, 0.070, 0.066]];
+    const skinP = new THREE.MeshPhongMaterial({ color:0xd9955f, specular:0x33221a, shininess:22 }), gold = new THREE.MeshPhongMaterial({ color:0xd4a72c, specular:0xfff2b0, shininess:80 }),
+      NEON = new THREE.MeshBasicMaterial({ color:0x21f3ff }), NEONM = new THREE.MeshBasicMaterial({ color:0xff2bd6 });   // luces neon (sin sombreado: brillan)
+    const torsoM = loftMesh(RINGS, [BD, NAVY, BL, BL, BL, BL, BL, NAVY, NAVY], 28);
+    torsoM.material = new THREE.MeshPhongMaterial({ vertexColors:true, specular:0x4a5a78, shininess:34, side:THREE.DoubleSide }); rig.add(torsoM);
+    const T = [], NL = [];
+    NL.push([0, 0.135, -0.116, 0.09, 0.012, 0.010, 0x21f3ff], [0, 0.135, -0.121, 0.03, 0.03, 0.008, 0xff2bd6]);   // hebilla neon
+    [-1, 1].forEach(k => {
+      // (bolsillos rectangulares eliminados: se veian como cajas pegadas)
+
+      rig.add(blobMesh(cabinLam(BD), 0.09, 0.07, 0.10, k * 0.190, 0.490, 0, 1));      // hombro redondeado
+      rig.add(blobMesh(cabinLam(BD), 0.085, 0.045, 0.085, k * 0.105, 0.535, 0.0, 1));   // trapecio: acorta el cuello
+    });
+    NL.push([0, 0.30, -0.110, 0.010, 0.28, 0.008, 0x21f3ff], [-0.075, 0.44, -0.110, 0.07, 0.008, 0.008, 0xff2bd6], [0.075, 0.44, -0.110, 0.07, 0.008, 0.008, 0xff2bd6]);   // cierre y lineas de pecho neon
+    T.push([-0.098, 0.385, -0.118, 0.058, 0.038, 0.012, 0xff2bd6], [-0.116, 0.385, -0.125, 0.010, 0.028, 0.006, 0x3a2a08],
+           [-0.098, 0.398, -0.125, 0.024, 0.008, 0.006, 0x3a2a08], [-0.098, 0.376, -0.125, 0.018, 0.008, 0.006, 0x3a2a08]);   // parche "FF"
+    rig.add(voxMesh(T));
+    const neonM = voxMesh(NL); neonM.material = new THREE.MeshBasicMaterial({ vertexColors:true }); rig.add(neonM);
+    [[0.135, 0.171, 0.116, NEON], [0.36, 0.176, 0.107, NEONM]].forEach(([y, a, b, m]) => {   // anillos neon de cintura y pecho
+      const r = new THREE.Mesh(new THREE.TorusGeometry(1, 0.0042, 6, 44), m); r.rotation.x = Math.PI / 2; r.scale.set(a, b, 1); r.position.y = y; r.frustumCulled = false; rig.add(r);
+    });
+    rig.add(buildSeatbelt(RINGS));
+    C.hair = buildPassengerHair(); C.hairMesh = C.hair.userData.mesh; rig.add(C.hair);
+    const nk = limbMesh(skinP); rig.add(nk); setLimb(nk, new THREE.Vector3(0, 0.53, -0.005), new THREE.Vector3(0, 0.66, -0.012), 0.088);   // cuello
+    const head = C.head = buildPassengerHead(); C.setBlink = head.userData.setBlink; head.position.set(0, 0.70, -0.015); rig.add(head);
+    [-1, 1].forEach(k => {                      // orejas y aros dorados
+      head.add(blobMesh(skinP, 0.014, 0.040, 0.028, k * 0.079, -0.006, 0.014, 0));
+      const hoop = new THREE.Mesh(new THREE.TorusGeometry(0.017, 0.0024, 8, 20), NEON); hoop.position.set(k * 0.082, -0.048, 0.014); hoop.rotation.y = Math.PI / 2; hoop.frustumCulled = false; head.add(hoop);
+      const lp = blobMesh(cabinLam(NAVY), 0.085, 0.022, 0.07, k * 0.062, 0.545, -0.072, 1); lp.rotation.z = -k * 0.55; lp.rotation.y = k * 0.35; rig.add(lp);   // solapas del cuello
+      const ch = limbMesh(NEON); rig.add(ch); setLimb(ch, new THREE.Vector3(k * 0.034, 0.552, -0.058), new THREE.Vector3(0, 0.506, -0.090), 0.004);
+    });
+    const nc = new THREE.Mesh(new THREE.TorusGeometry(0.056, 0.0032, 8, 32), NEON); nc.position.set(0, 0.562, -0.004); nc.rotation.x = Math.PI / 2; nc.frustumCulled = false; rig.add(nc);   // collar
+    rig.add(blobMesh(NEONM, 0.016, 0.020, 0.008, 0, 0.500, -0.092, 0));
+
+    // Piernas sentadas y botas (apoyadas en el piso)
+    [-1, 1].forEach(k => {
+      const hip = new THREE.Vector3(k * 0.09, 0.03, -0.03), knee = new THREE.Vector3(k * 0.10, 0.03, -0.42), ank = new THREE.Vector3(k * 0.10, -0.36, -0.48);
+      [[hip, knee, 0.15], [knee, ank, 0.12]].forEach(([a, b, t]) => { const m = limbMesh(blueD); rig.add(m); setLimb(m, a, b, t); });
+      rig.add(blobMesh(blueD, 0.15, 0.15, 0.15, knee.x, knee.y, knee.z, 1));                       // rodilla facetada
+      rig.add(blobMesh(blueD, 0.19, 0.16, 0.20, k * 0.09, 0.03, -0.03, 1));   // cadera suave: une torso y muslo
+      neonRing(rig, hip, knee, 0.55, 0.079, NEON); neonRing(rig, knee, ank, 0.5, 0.064, NEONM);   // franjas neon en muslo y pantorrilla
+      rig.add(blobMesh(dark, 0.14, 0.10, 0.30, ank.x, ank.y - 0.04, ank.z - 0.06, 1));            // bota facetada
+    });
+
+    // Brazos con IK: codo hacia abajo y afuera. Derecha: alcanza los botones del panel rojo. Izquierda: descansa en el muslo.
+    const thY = P.bodyYaw, cyw = Math.cos(thY), syw = Math.sin(thY);
+    const toRig = (gx, gy, gz) => {            // cabina -> local del cuerpo (deshace escala, posicion y giro del torso)
+      const x = (gx - P.x) / P.scale, y = (gy - P.floorY) / P.scale - 0.45, z = (gz - P.z) / P.scale;
+      return new THREE.Vector3(x * cyw - z * syw, y, x * syw + z * cyw);
+    };
+    [['R', 1], ['L', -1]].forEach(([k, side]) => {
+      const H = (side > 0) ? toRig(P.panelHand[0], P.panelHand[1], P.panelHand[2]) : new THREE.Vector3().fromArray(P.handL);
+      const phi = (side > 0) ? (-Math.PI / 2 - thY) : side * 0.08;       // derecha: dedos hacia el panel (+x cabina)
+      const sh = new THREE.Vector3(side * 0.20, 0.47, 0);
+      const wr = H.clone().add(new THREE.Vector3(Math.sin(phi) * 0.085, 0.015, Math.cos(phi) * 0.085));
+      const el = solveElbow(sh, wr, P.upperArm, P.foreArm, new THREE.Vector3(side * 0.6, -0.8, 0.6));
+      const mid = el.clone().lerp(wr, 0.80);   // la manga cubre casi todo el antebrazo
+      const limb = (a, b, t, mat) => { const m = limbMesh(mat); rig.add(m); setLimb(m, a, b, t); };
+      limb(sh, el, 0.092, blue); rig.add(blobMesh(blue, 0.10, 0.10, 0.10, el.x, el.y, el.z, 1)); limb(el, mid, 0.082, blue); limb(mid, wr, 0.060, skinP); limb(mid.clone().lerp(el, 0.12), mid.clone().lerp(wr, 0.22), 0.088, navy);
+      neonRing(rig, sh, el, 0.5, 0.05, NEON); neonRing(rig, el, wr, 0.80, 0.046, NEONM); neonRing(rig, mid, wr, 0.95, 0.034, NEON);   // neon en brazo, puno y muneca
+      const hand = buildPassengerHand(0xd9955f, side);   // la mano sigue la direccion del antebrazo y se pega a la muneca (sin huecos)
+      const fd = wr.clone().sub(el).normalize(), fl = new THREE.Vector3(-Math.sin(phi), 0, -Math.cos(phi)), fh = fd.clone().multiplyScalar(0.65).addScaledVector(fl, 0.35).normalize();
+      const yA = new THREE.Vector3(0, 1, 0); yA.addScaledVector(fh, -yA.dot(fh)).normalize(); const zA = fh.clone().negate(), xA = new THREE.Vector3().crossVectors(yA, zA);
+      hand.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(xA, yA, zA)); hand.position.copy(wr).addScaledVector(fh, 0.068); rig.add(hand);
+    });
+
+    // ----- Consola central: tunel, tapa con apoyabrazos, portavasos, palanca y freno de mano rojo -----
+    const con = C.console = new THREE.Group(); g.add(con);
+    const K = CONSOLE, zc = (K.zFront + K.zBack) / 2, len = K.zBack - K.zFront, h = 0.30;
+    cabinBox(con, cabinLam(0x14161a), K.w, h, len, K.x, K.topY - h / 2, zc);
+    cabinBox(con, leather, K.w - 0.02, 0.04, 0.34, K.x, K.topY + 0.015, K.zBack - 0.22);
+    cabinBox(con, cabinLam(0x0d0e10), K.w - 0.04, 0.012, 0.16, K.x, K.topY + 0.006, K.zFront + 0.78);
+    [-0.055, 0.055].forEach(dx => {
+      const cup = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.032, 0.016, 14), dark);
+      cup.position.set(K.x + dx, K.topY + 0.014, K.zFront + 0.78); cup.frustumCulled = false; con.add(cup);
+    });
+    cabinBox(con, cabinLam(0x9aa0a6), 0.012, 0.010, 0.22, K.x + 0.11, K.topY + 0.02, K.zFront + 0.45);
+    const stem = new THREE.Mesh(new THREE.CylinderGeometry(0.014, 0.018, 0.14, 10), cabinLam(0x8a929b));
+    stem.position.set(K.x - 0.06, K.topY + 0.09, K.zFront + 0.30); stem.rotation.x = 0.12; stem.frustumCulled = false; con.add(stem);
+    const knob = new THREE.Mesh(new THREE.SphereGeometry(0.034, 12, 10), leather);
+    knob.position.set(K.x - 0.06, K.topY + 0.17, K.zFront + 0.31); knob.frustumCulled = false; con.add(knob);
+    cabinBox(con, cabinLam(0x0e0f12), 0.13, 0.03, 0.22, K.x - 0.06, K.topY - 0.005, K.zFront + 0.30);
+    cabinBox(con, cabinLam(0xc0261f), 0.05, 0.03, 0.09, K.x + 0.05, K.topY + 0.03, K.zFront + 0.62);
+  }
+  // Vida: respira, se inclina en las curvas, mira al frente y cada tanto gira la cabeza para mirarte a ti (y parpadea).
+  const t = (typeof elapsed === 'number') ? elapsed : 0;
+  const st = clamp(carState.steer, -1, 1);
+  const PP = PASSENGER;
+  const ci = Math.floor(t / PP.glanceEvery), ph = t - ci * PP.glanceEvery;
+  const g0 = PP.glanceEvery * 0.25 + _rnd(ci, 7) * PP.glanceEvery * 0.30, gd = 3.5 + _rnd(ci, 3) * 1.5;
+  let gl = 0;
+  if(ph > g0 && ph < g0 + gd){
+    const u = ph - g0, sm = x => { x = Math.max(0, Math.min(1, x)); return x * x * (3 - 2 * x); };
+    gl = sm(u / 1.4) * sm((gd - u) / 1.4);      // gira despacio (1.4 s), te mira un rato y vuelve despacio
+  }
+  C.rig.scale.y = 1 + Math.sin(t * 1.6) * 0.005;
+  C.rig.rotation.y = PP.bodyYaw;
+  C.rig.rotation.z = -st * 0.03;
+  // yaw de la cabeza respecto al torso: (mirada en el mundo) - (giro del torso)
+  C.head.rotation.y = (PP.headYaw - st * 0.14 + Math.sin(t * 0.45) * 0.03 + gl * PP.glanceYaw) - PP.bodyYaw;
+  C.head.rotation.x = Math.sin(t * 0.6) * 0.012 + gl * 0.03;
+  C.head.rotation.z = st * 0.03;
+  animatePassengerHair(C, t, C.head.rotation.y, st);
+  if(C.setBlink) C.setBlink((t % 4.3) > 4.16);
 }
 
 // ===== AGUA EN EL PARABRISAS + LUCES DEL TABLERO =====
@@ -1941,10 +2619,10 @@ function layoutCarCabin(){
   setCenter(p.radio, 0.40, -0.29, 0.30, 0.24, 0.04);
   setCenter(p.gearDisplay, 0.40, -0.46, 0.25, 0.12, 0.025);
   setCenter(p.switchRight, 0.40, -0.62, 0.28, 0.18, 0.035);
-  setCenter(p.gearLever, 0.10, -0.56, 0.18, 0.14, 0.03);
+  if(p.gearLever) p.gearLever.visible = false;   // la consola 3D trae su propia palanca
   if(p.floor) { p.floor.position.set(0, -0.78, -0.56); p.floor.rotation.x = 0; p.floor.scale.set(1.25, 1, 1.05); }
   if(p.dashPanel) { p.dashPanel.position.set(0, -0.52, -0.72); p.dashPanel.scale.set(0.86, 0.58, 1); }
-  if(p.roof) { p.roof.position.set(0, 0.58, -0.78); p.roof.rotation.x = 0; p.roof.scale.set(1.06, 1, 1); }
+  if(p.roof) { p.roof.position.set(0, 0.70, -0.78); p.roof.rotation.x = 0; p.roof.scale.set(1.06, 1, 1); }
   if(p.seatL) { p.seatL.position.set(-0.32, -0.54, 0.82); p.seatL.rotation.y = 0.12; }
   if(p.seatR) { p.seatR.position.set(0.32, -0.54, 0.82); p.seatR.rotation.y = -0.12; }
   if(p.doorTrimL) { p.doorTrimL.position.set(-0.79, -0.18, -0.84); p.doorTrimL.scale.set(1.7, 1.16, 1); }
@@ -2024,6 +2702,7 @@ function layoutCarCabin(){
   if(p.rightPod) p.rightPod.rotation.z = 0.0;
   if(p.leftPod2) p.leftPod2.rotation.z = 0.08;
   if(p.rightPod2) p.rightPod2.rotation.z = -0.08;
+  ['leftPod','rightPod','leftPod2','rightPod2'].forEach(n => { if(p[n]) p[n].visible = false; });   // testigos redondos del tablero: eliminados
 
   if(carGroup.userData.leftHand) carGroup.userData.leftHand.position.set(-0.24, 0.10, -0.02);
   if(carGroup.userData.rightHand) carGroup.userData.rightHand.position.set(0.24, 0.10, -0.02);
@@ -2039,6 +2718,9 @@ function layoutCarCabin(){
   // Conductor, volante y rellenos del tablero.
   buildCabinDriver(p, hw, hh);
 
+  // Copiloto, consola central y asientos (3D real).
+  buildCabinPassenger(p, hw, hh);
+
   // Agua en el parabrisas y luces del tablero.
   buildCabinFX(p, hw, hh);
 }
@@ -2047,294 +2729,98 @@ function layoutCarCabin(){
    MODELO DEL AUTO (exterior)
    ══════════════════════════════════════════════════════════════ */
 function buildCarModel(){
+  // Camioneta blindada rosa "DARK MATTER DESIGN DMD-H1" (frente = +z, lado izquierdo = +x). Ruedas, puertas y faros mantienen el mismo contrato (userData.wheels / exteriorDoors / light).
   const g = new THREE.Group();
-  const BODY = 0xb0102f;
-  const BODY_DARK = 0x6d0a1c;
-  const BODY_LIGHT = 0xe14d5e;
-  const BODY_ACCENT = 0x11161c;
-  const GLASS = 0x9bb9c8;
-  const TRIM = 0x1f242b;
-  const TIRE = 0x121417;
-  const RIM = 0xd9dfe5;
-  const LIGHT = 0xf4f0c1;
-  const TAILLIGHT = 0xff3a2c;
-  const STEEL = 0x747b85;
+  const PK = 0xe8709f, PKD = 0xc44a82, PKL = 0xf08cb4, DK = 0x1c2233, TIRE = 0x141830, GL = 0x151d36, GUN = 0x434b5e, STRAP = 0xa5582c;
+  const MC = {}, lam = c => MC[c] || (MC[c] = new THREE.MeshLambertMaterial({ color:c, flatShading:true })), bas = c => new THREE.MeshBasicMaterial({ color:c, fog:false });
+  const mat = m => typeof m === 'number' ? lam(m) : m;
+  const box = (w, h, d, x, y, z, m, p = g, rx = 0, rz = 0) => { const o = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat(m)); o.position.set(x, y, z); o.rotation.x = rx; o.rotation.z = rz; p.add(o); return o; };
+  const cyl = (r, r2, h, seg, x, y, z, m, axisX, p = g) => { const o = new THREE.Mesh(new THREE.CylinderGeometry(r, r2, h, seg), mat(m)); o.position.set(x, y, z); if(axisX) o.rotation.z = Math.PI / 2; p.add(o); return o; };
+  const decal = (w, h, x, y, z, side, draw) => {
+    const cv = document.createElement('canvas'); cv.width = 512; cv.height = Math.round(512 * h / w); const c = cv.getContext('2d'); draw(c, cv.width, cv.height);
+    const tx = new THREE.CanvasTexture(cv); tx.anisotropy = 4;
+    const o = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ map:tx, transparent:true })); o.position.set(side * x, y, z); o.rotation.y = side * Math.PI / 2; g.add(o); return o;
+  };
+  const txt = (c, s, x, y, size, col, bold) => { c.font = (bold ? 'bold ' : '') + size + 'px Arial, sans-serif'; c.fillStyle = col; c.textBaseline = 'middle'; c.fillText(s, x, y); };
 
-  const lower = new THREE.Mesh(
-    new THREE.BoxGeometry(2.1, 0.28, 4.5),
-    new THREE.MeshLambertMaterial({ color: BODY_DARK, flatShading: true })
-  );
-  lower.position.y = 0.32;
-  g.add(lower);
-
-  const floor = new THREE.Mesh(
-    new THREE.BoxGeometry(1.9, 0.16, 3.8),
-    new THREE.MeshLambertMaterial({ color: BODY, flatShading: true })
-  );
-  floor.position.y = 0.58;
-  g.add(floor);
-
-  const frontClip = new THREE.Mesh(
-    new THREE.BoxGeometry(1.7, 0.22, 0.8),
-    new THREE.MeshLambertMaterial({ color: BODY_LIGHT, flatShading: true })
-  );
-  frontClip.position.set(0, 0.7, 2.06);
-  g.add(frontClip);
-
-  const hood = new THREE.Mesh(
-    new THREE.BoxGeometry(1.8, 0.22, 1.6),
-    new THREE.MeshLambertMaterial({ color: BODY_LIGHT, flatShading: true })
-  );
-  hood.position.set(0, 1.02, 1.4);
-  hood.rotation.x = -0.03;
-  g.add(hood);
-
-  const nose = new THREE.Mesh(
-    new THREE.BoxGeometry(1.4, 0.18, 0.62),
-    new THREE.MeshLambertMaterial({ color: BODY_ACCENT, flatShading: true })
-  );
-  nose.position.set(0, 0.88, 2.25);
-  g.add(nose);
-
-  const fenderBase = new THREE.Mesh(
-    new THREE.BoxGeometry(2.25, 0.6, 1.35),
-    new THREE.MeshLambertMaterial({ color: BODY, flatShading: true })
-  );
-  fenderBase.position.set(0, 0.98, 0.1);
-  g.add(fenderBase);
-
-  const cabin = new THREE.Mesh(
-    new THREE.BoxGeometry(1.62, 0.72, 1.72),
-    new THREE.MeshLambertMaterial({ color: BODY, flatShading: true })
-  );
-  cabin.position.set(0, 1.52, -0.12);
-  g.add(cabin);
-
-  const roof = new THREE.Mesh(
-    new THREE.BoxGeometry(1.34, 0.08, 1.34),
-    new THREE.MeshLambertMaterial({ color: BODY_LIGHT, flatShading: true })
-  );
-  roof.position.set(0, 1.94, -0.12);
-  g.add(roof);
-
-  const windshield = new THREE.Mesh(
-    new THREE.BoxGeometry(1.4, 0.58, 0.08),
-    new THREE.MeshLambertMaterial({ color: GLASS, transparent: true, opacity: 0.82, flatShading: true })
-  );
-  windshield.position.set(0, 1.56, 0.82);
-  windshield.rotation.x = 0.36;
-  g.add(windshield);
-
-  const rearGlass = new THREE.Mesh(
-    new THREE.BoxGeometry(1.38, 0.54, 0.08),
-    new THREE.MeshLambertMaterial({ color: GLASS, transparent: true, opacity: 0.82, flatShading: true })
-  );
-  rearGlass.position.set(0, 1.5, -1.04);
-  rearGlass.rotation.x = -0.4;
-  g.add(rearGlass);
-
+  // ---- chasis y carroceria baja ----
+  box(1.94, 0.30, 4.55, 0, 0.66, 0, DK);
+  box(1.92, 0.46, 2.90, 0, 1.05, 0.85, PK);
+  box(1.90, 0.20, 1.25, 0, 1.38, 1.675, PKL);                        // capo
+  box(1.90, 0.22, 0.42, 0, 1.30, 2.25, PKL, g, 0.5);                 // frente inclinado
+  box(1.96, 0.24, 0.34, 0, 0.62, 2.36, DK);                          // parachoques delantero
+  box(1.0, 0.34, 0.06, 0, 1.02, 2.33, DK);                           // parrilla
+  for(let i = 0; i < 3; i++) box(0.9, 0.03, 0.05, 0, 0.93 + i * 0.09, 2.36, 0x6b7385);
+  box(1.96, 0.20, 0.30, 0, 0.66, -2.38, DK);                         // parachoques trasero
+  // ---- cabina ----
+  box(1.88, 0.94, 1.70, 0, 1.52, 0.25, PK);
+  box(1.80, 0.10, 1.50, 0, 2.03, 0.20, PKL);
+  box(1.10, 0.03, 0.55, 0, 2.10, 0.45, 0x171c28);                    // panel solar
+  box(1.84, 0.14, 0.30, 0, 1.98, 1.05, PKD);                         // visera blindada
+  box(1.62, 0.50, 0.05, 0, 1.68, 1.13, new THREE.MeshLambertMaterial({ color:GL, transparent:true, opacity:0.9, flatShading:true }), g, -0.18);
+  box(1.2, 0.40, 0.05, 0, 1.68, -0.63, GL);                          // vidrio trasero
+  // ---- caja de carga ----
+  box(1.90, 0.22, 1.70, 0, 0.90, -1.45, PKD);
+  box(1.90, 0.10, 1.70, 0, 1.03, -1.45, DK);
+  box(0.09, 0.42, 1.70, 0.93, 1.28, -1.45, PK); box(0.09, 0.42, 1.70, -0.93, 1.28, -1.45, PK);
+  box(1.90, 0.42, 0.09, 0, 1.28, -2.28, PK);
+  // ---- carga: barriles y rocas ----
+  [[-0.42, -1.05], [0.38, -1.75], [0.42, -1.2]].forEach(([x, z]) => { cyl(0.25, 0.25, 0.44, 10, x, 1.32, z, 0x7c4322); cyl(0.265, 0.265, 0.05, 10, x, 1.56, z, 0x5a3018); });
+  [[-0.3, 1.2, -1.75, 0.5, 0x1d2f7a], [0.0, 1.22, -1.45, 0.42, 0x2b46b0], [-0.55, 1.2, -1.4, 0.36, 0x141a33], [0.1, 1.2, -2.05, 0.34, 0x2b46b0], [-0.1, 1.42, -1.65, 0.3, 0x9a5a1e], [0.55, 1.2, -1.85, 0.3, 0x1d2f7a], [-0.55, 1.2, -2.0, 0.3, 0x141a33]].forEach(([x, y, z, s, c], i) => box(s, s * 0.8, s, x, y, z, c, g, i * 0.5, i * 0.4));
+  // ---- estructura y DOS propulsores (uno a cada lado, sobre la parte trasera, apuntando hacia adelante y arriba) ----
+  box(1.90, 0.42, 0.90, 0, 2.21, -0.75, PK);
+  box(0.14, 0.75, 0.14, 0.85, 1.65, -1.12, PKD); box(0.14, 0.75, 0.14, -0.85, 1.65, -1.12, PKD);
+  for(const sx of [-1, 1]){
+    box(0.74, 0.26, 0.90, sx * 0.62, 2.50, -0.80, DK); box(0.16, 0.40, 0.16, sx * 0.62, 2.60, -1.05, 0x2e3546);
+    const th = new THREE.Group(); th.position.set(sx * 0.62, 2.92, -0.78);
+    th.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), new THREE.Vector3(sx * 0.16, 0.30, 0.94).normalize());
+    cyl(0.5, 0.5, 1.1, 14, 0, 0, 0, GUN, false, th); cyl(0.42, 0.5, 0.16, 14, 0, -0.62, 0, 0x343b4b, false, th);
+    cyl(0.57, 0.57, 0.14, 14, 0, 0.55, 0, 0x5a6478, false, th); cyl(0.41, 0.41, 0.16, 14, 0, 0.555, 0, 0x232a3a, false, th);
+    const disc = (r, y, c) => { const d = new THREE.Mesh(new THREE.CircleGeometry(r, 22), bas(c)); d.rotation.x = -Math.PI / 2; d.position.y = y; th.add(d); };
+    disc(0.37, 0.64, 0x8a3fe0); disc(0.27, 0.645, 0xa565ff); disc(0.14, 0.65, 0xe9d2ff);           // interior morado brillante
+    [0.30, 0.19].forEach((r, i) => { const t = new THREE.Mesh(new THREE.TorusGeometry(r, 0.014, 5, 22), bas(0xc79bff)); t.rotation.x = Math.PI / 2; t.position.y = 0.655 + i * 0.002; th.add(t); });
+    [-0.28, 0.02, 0.30].forEach(y => { const t = new THREE.Mesh(new THREE.TorusGeometry(0.52, 0.036, 6, 20), lam(0xb8703a)); t.rotation.x = Math.PI / 2; t.position.y = y; th.add(t); box(0.16, 0.14, 0.1, 0.53, y, 0, 0x7a3f1c, th); });   // bobinas de cobre
+    for(let i = 0; i < 8; i++){ const a = i / 8 * Math.PI * 2; box(0.10, 0.9, 0.08, Math.cos(a) * 0.5, -0.02, Math.sin(a) * 0.5, 0x2e3546, th); }
+    for(let i = 0; i < 10; i++){ const a = i / 10 * Math.PI * 2; box(0.12, 0.12, 0.16, Math.cos(a) * 0.58, 0.55, Math.sin(a) * 0.58, 0x7b8598, th).rotation.y = -a; }
+    g.add(th);
+  }
+  // ---- aletas de rueda + eje trasero ----
+  for(const sx of [-1, 1]){ box(0.46, 0.16, 1.2, sx * 1.04, 1.12, 1.5, PK); box(0.58, 0.14, 1.75, sx * 1.2, 1.68, -1.5, PK); box(0.14, 0.9, 0.14, sx * 1.08, 1.22, -1.5, DK); }
+  box(2.3, 0.14, 0.16, 0, 0.78, -1.5, DK);
+  // ---- lados: ventanas, puertas, aro de equilibrio, escalera y rotulos ----
+  const doors = [];
   for(const side of [-1, 1]){
-    const sideGlass = new THREE.Mesh(
-      new THREE.BoxGeometry(0.05, 0.52, 1.4),
-      new THREE.MeshLambertMaterial({ color: GLASS, transparent: true, opacity: 0.76, flatShading: true })
-    );
-    sideGlass.position.set(side * 0.78, 1.52, -0.08);
-    g.add(sideGlass);
-
-    const mirror = new THREE.Mesh(
-      new THREE.BoxGeometry(0.18, 0.12, 0.08),
-      new THREE.MeshLambertMaterial({ color: TRIM, flatShading: true })
-    );
-    mirror.position.set(side * 0.92, 1.4, 0.7);
-    g.add(mirror);
+    box(0.05, 0.42, 0.42, side * 0.955, 1.68, -0.02, GL);
+    const hinge = new THREE.Group(); hinge.position.set(side * 0.965, 1.52, 0.25);
+    box(0.06, 0.88, 0.80, side * 0.03, 0, 0.40, PK, hinge); box(0.065, 0.40, 0.62, side * 0.034, 0.16, 0.40, GL, hinge); box(0.07, 0.05, 0.18, side * 0.05, -0.12, 0.65, DK, hinge);
+    g.add(hinge); doors.push({ hinge, side });
+    // aro brillante (sistema de equilibrio)
+    const ring = new THREE.Group(); ring.position.set(side * 1.06, 1.02, 0.28); g.add(ring);
+    cyl(0.44, 0.44, 0.22, 12, 0, 0, 0, 0xdbe8f2, true, ring); cyl(0.31, 0.31, 0.235, 16, 0, 0, 0, bas(0x3eeaff), true, ring);
+    cyl(0.24, 0.24, 0.24, 16, 0, 0, 0, 0xe9fbff, true, ring); cyl(0.13, 0.13, 0.25, 12, 0, 0, 0, bas(0x3eeaff), true, ring);
+    box(0.04, 0.56, 0.04, side * 1.0, 0.56, 0.05, DK); box(0.04, 0.56, 0.04, side * 1.0, 0.56, 0.58, DK); [0.4, 0.55, 0.7].forEach(y => box(0.04, 0.04, 0.55, side * 1.0, y, 0.31, DK));
+    decal(0.85, 0.40, 0.972, 1.06, 1.08, side, (c, w, h) => { c.fillStyle = '#0d121c'; c.beginPath(); c.moveTo(0.06 * w, 0); c.lineTo(w, 0); c.lineTo(w, h); c.lineTo(0, h); c.closePath(); c.fill(); txt(c, 'ALL-TERRAIN', 0.12 * w, 0.24 * h, 46, '#e9eef5', true); txt(c, 'ACTIVE EQUILIBRIUM SYSTEM', 0.12 * w, 0.52 * h, 30, '#cfd8e3', false); txt(c, 'ANTI-TIP SYSTEM', 0.12 * w, 0.76 * h, 32, '#cfd8e3', false); c.fillStyle = '#3eeaff'; c.fillRect(0.12 * w, 0.9 * h, 0.3 * w, 5); });
+    decal(0.30, 0.42, 0.972, 1.55, -0.42, side, (c, w, h) => { c.fillStyle = '#0d121c'; c.fillRect(0, 0, w, h); txt(c, 'DMD-H1', 0.08 * w, 0.14 * h, 58, '#e9eef5', true); c.fillStyle = '#5a6478'; for(let i = 0; i < 9; i++) c.fillRect(0.08 * w, (0.3 + i * 0.075) * h, (0.55 + ((i * 37) % 30) / 100) * w, 6); });
+    decal(0.85, 0.34, 0.955, 2.21, -0.75, side, (c, w, h) => { txt(c, 'DARK MATTER', 0.06 * w, 0.30 * h, 70, '#1a2138', true); txt(c, 'DESIGN', 0.06 * w, 0.66 * h, 70, '#1a2138', true); c.fillStyle = '#1a2138'; c.fillRect(0.06 * w, 0.86 * h, 0.4 * w, 4); c.fillRect(0.06 * w, 0.92 * h, 0.28 * w, 4); });
   }
-
-  // Puertas exteriores con bisagra para la animacion de entrada y salida.
-  const exteriorDoors = [];
+  g.userData.exteriorDoors = doors;
+  // ---- luces ----
   for(const side of [-1, 1]){
-    const hinge = new THREE.Group();
-    hinge.position.set(side * 0.82, 1.18, -0.20);
-    const panel = new THREE.Mesh(
-      new THREE.BoxGeometry(0.08, 0.72, 1.38),
-      new THREE.MeshLambertMaterial({ color: BODY, flatShading: true })
-    );
-    panel.position.x = side * 0.07;
-    hinge.add(panel);
-    const window = new THREE.Mesh(
-      new THREE.BoxGeometry(0.085, 0.28, 1.05),
-      new THREE.MeshLambertMaterial({ color: GLASS, transparent: true, opacity: 0.78, flatShading: true })
-    );
-    window.position.set(side * 0.075, 0.18, 0);
-    hinge.add(window);
-    g.add(hinge);
-    exteriorDoors.push({ hinge, side });
+    const head = new THREE.Mesh(new THREE.BoxGeometry(0.26, 0.16, 0.06), bas(0xfff6d0)); head.position.set(side * 0.72, 1.1, 2.33); g.add(head);
+    const hl = new THREE.SpotLight(0xfff6c9, 0.0, 55, Math.PI / 7.5, 0.35, 1.8); hl.position.set(side * 0.7, 1.1, 2.4); hl.target.position.set(side * 0.7, 1.0, 14); hl.visible = false; hl.castShadow = false; g.add(hl); g.add(hl.target); head.userData.light = hl;
+    const tail = new THREE.Mesh(new THREE.BoxGeometry(0.30, 0.14, 0.04), bas(0xff3a2c)); tail.position.set(side * 0.7, 1.3, -2.33); g.add(tail);
   }
-  g.userData.exteriorDoors = exteriorDoors;
-
-  const rearDeck = new THREE.Mesh(
-    new THREE.BoxGeometry(1.7, 0.2, 1.45),
-    new THREE.MeshLambertMaterial({ color: BODY_LIGHT, flatShading: true })
-  );
-  rearDeck.position.set(0, 1.0, -1.52);
-  g.add(rearDeck);
-
-  const rearBumper = new THREE.Mesh(
-    new THREE.BoxGeometry(1.9, 0.18, 0.22),
-    new THREE.MeshLambertMaterial({ color: TRIM, flatShading: true })
-  );
-  rearBumper.position.set(0, 0.52, -2.1);
-  g.add(rearBumper);
-
-  const frontBumper = new THREE.Mesh(
-    new THREE.BoxGeometry(1.9, 0.18, 0.22),
-    new THREE.MeshLambertMaterial({ color: TRIM, flatShading: true })
-  );
-  frontBumper.position.set(0, 0.52, 2.1);
-  g.add(frontBumper);
-
-  const splitter = new THREE.Mesh(
-    new THREE.BoxGeometry(1.8, 0.08, 0.3),
-    new THREE.MeshLambertMaterial({ color: BODY_ACCENT, flatShading: true })
-  );
-  splitter.position.set(0, 0.22, 2.12);
-  g.add(splitter);
-
-  const rearDiffuser = new THREE.Mesh(
-    new THREE.BoxGeometry(1.7, 0.08, 0.28),
-    new THREE.MeshLambertMaterial({ color: BODY_ACCENT, flatShading: true })
-  );
-  rearDiffuser.position.set(0, 0.2, -2.14);
-  g.add(rearDiffuser);
-
-  const grille = new THREE.Mesh(
-    new THREE.BoxGeometry(0.96, 0.18, 0.08),
-    new THREE.MeshLambertMaterial({ color: TRIM, flatShading: true })
-  );
-  grille.position.set(0, 0.78, 2.06);
-  g.add(grille);
-
-  const grille2 = new THREE.Mesh(
-    new THREE.BoxGeometry(0.72, 0.14, 0.06),
-    new THREE.MeshLambertMaterial({ color: STEEL, flatShading: true })
-  );
-  grille2.position.set(0, 0.78, 2.12);
-  g.add(grille2);
-
-  const sideSkirtL = new THREE.Mesh(
-    new THREE.BoxGeometry(0.12, 0.16, 3.7),
-    new THREE.MeshLambertMaterial({ color: BODY_ACCENT, flatShading: true })
-  );
-  sideSkirtL.position.set(-0.98, 0.2, 0.02);
-  g.add(sideSkirtL);
-
-  const sideSkirtR = sideSkirtL.clone();
-  sideSkirtR.position.x = 0.98;
-  g.add(sideSkirtR);
-
-  for(const side of [-1, 1]){
-    const head = new THREE.Mesh(
-      new THREE.BoxGeometry(0.42, 0.19, 0.08),
-      new THREE.MeshBasicMaterial({ color: LIGHT, fog: false })
-    );
-    head.position.set(side * 0.52, 0.92, 2.03);
-    g.add(head);
-
-    const headLight = new THREE.SpotLight(0xfff6c9, 0.0, 55, Math.PI / 7.5, 0.35, 1.8);
-    headLight.position.set(side * 0.58, 0.9, 2.12);
-    headLight.target.position.set(side * 0.58, 0.9, 14);
-    headLight.visible = false;
-    headLight.castShadow = false;
-    g.add(headLight);
-    g.add(headLight.target);
-
-    head.userData.light = headLight;
-  }
-
-  for(const side of [-1, 1]){
-    const tail = new THREE.Mesh(
-      new THREE.BoxGeometry(0.44, 0.18, 0.08),
-      new THREE.MeshBasicMaterial({ color: TAILLIGHT, fog: false })
-    );
-    tail.position.set(side * 0.54, 0.92, -2.03);
-    g.add(tail);
-  }
-
-  const stripeA = new THREE.Mesh(
-    new THREE.BoxGeometry(0.12, 0.02, 3.2),
-    new THREE.MeshLambertMaterial({ color: 0xfff7f0, emissive: 0x1a1a1a, flatShading: true })
-  );
-  stripeA.position.set(0, 1.3, 0.1);
-  g.add(stripeA);
-
-  const stripeB = stripeA.clone();
-  stripeB.position.x = 0.25;
-  g.add(stripeB);
-
-  const wheelGeo = new THREE.CylinderGeometry(0.48, 0.48, 0.34, 18);
-  const rimGeo = new THREE.CylinderGeometry(0.27, 0.27, 0.36, 12);
-  const wheels = [];
-
-  for(const [sx, sz] of [[-1, 1], [1, 1], [-1, -1], [1, -1]]){
-    const wheel = new THREE.Mesh(wheelGeo, new THREE.MeshLambertMaterial({ color: TIRE, flatShading: true }));
-    wheel.rotation.z = Math.PI / 2;
-    wheel.position.set(sx * 1.02, 0.42, sz * 1.35);
-    g.add(wheel);
-
-    const rim = new THREE.Mesh(rimGeo, new THREE.MeshLambertMaterial({ color: RIM, flatShading: true }));
-    rim.rotation.z = Math.PI / 2;
-    rim.position.copy(wheel.position);
-    g.add(rim);
-
-    const arch = new THREE.Mesh(
-      new THREE.BoxGeometry(0.18, 0.38, 1.0),
-      new THREE.MeshLambertMaterial({ color: BODY_DARK, flatShading: true })
-    );
-    arch.position.set(sx * 1.0, 0.7, sz * 1.35);
-    g.add(arch);
-
-    wheels.push(wheel, rim);
-  }
-
-  const interior = new THREE.Group();
-  const seatBase = new THREE.Mesh(
-    new THREE.BoxGeometry(0.62, 0.22, 0.8),
-    new THREE.MeshLambertMaterial({ color: BODY_ACCENT, flatShading: true })
-  );
-  seatBase.position.set(0, 0.95, -0.08);
-  interior.add(seatBase);
-
-  const seatBack = new THREE.Mesh(
-    new THREE.BoxGeometry(0.62, 0.72, 0.18),
-    new THREE.MeshLambertMaterial({ color: BODY_ACCENT, flatShading: true })
-  );
-  seatBack.position.set(0, 1.32, -0.42);
-  interior.add(seatBack);
-
-  const wheelSteer = new THREE.Mesh(
-    new THREE.TorusGeometry(0.22, 0.04, 8, 16),
-    new THREE.MeshLambertMaterial({ color: STEEL, flatShading: true })
-  );
-  wheelSteer.rotation.y = Math.PI / 2;
-  wheelSteer.position.set(0, 1.18, 0.42);
-  interior.add(wheelSteer);
-
-  const wheelHub = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.04, 0.04, 0.12, 9),
-    new THREE.MeshLambertMaterial({ color: TRIM, flatShading: true })
-  );
-  wheelHub.rotation.z = Math.PI / 2;
-  wheelHub.position.set(0, 1.18, 0.42);
-  interior.add(wheelHub);
-
-  g.add(interior);
-
-  const dashboard = new THREE.Mesh(
-    new THREE.BoxGeometry(1.1, 0.08, 0.5),
-    new THREE.MeshLambertMaterial({ color: BODY_ACCENT, flatShading: true })
-  );
-  dashboard.position.set(0, 1.2, 0.48);
-  g.add(dashboard);
-
+  // ---- ruedas: delanteras normales, traseras enormes (pares [llanta, centro] para la animacion de giro) ----
+  const wheels = [], lugG = new THREE.BoxGeometry(0.11, 1, 0.15);
+  [[-1, 1.5, 0.52, 0.42, 14], [1, 1.5, 0.52, 0.42, 14], [-1, -1.5, 0.82, 0.50, 22], [1, -1.5, 0.82, 0.50, 22]].forEach(([sx, sz, R, W, n]) => {
+    const x = sx * (R > 0.6 ? 1.20 : 1.04), y = R - 0.04;
+    const tire = cyl(R, R, W, 18, x, y, sz, TIRE, true);
+    for(let i = 0; i < n; i++){ const a = i / n * Math.PI * 2, l = new THREE.Mesh(lugG, lam(0x0c0f22)); l.scale.y = W * 0.94; l.position.set(Math.cos(a) * R, 0, Math.sin(a) * R); l.rotation.y = -a; tire.add(l); }
+    const hub = cyl(R * 0.6, R * 0.6, W * 1.03, 16, x, y, sz, PKD, true);
+    cyl(R * 0.34, R * 0.34, W * 1.07, 10, 0, 0, 0, 0x2a1730, false, hub);
+    for(let i = 0; i < 6; i++){ const a = i / 6 * Math.PI * 2; box(0.06, W * 1.1, 0.06, Math.cos(a) * R * 0.46, 0, Math.sin(a) * R * 0.46, 0x9aa0b0, hub); }
+    wheels.push(tire, hub);
+  });
   g.userData.wheels = wheels;
   return g;
 }
@@ -5844,7 +6330,7 @@ function setupInput(){
       shipState.yaw -= dx*0.006;
       shipState.pitch = clamp(shipState.pitch - dy*0.005, -1.2, 1.2);
     } else if(inCar){
-      carLookYaw = clamp(carLookYaw - dx*0.006, -1.05, 1.05);
+      carLookYaw = clamp(carLookYaw - dx*0.006, -1.30, 1.30);
       carLookPitch = clamp(carLookPitch - dy*0.005, -0.42, 0.34);
     } else {
       camState.yaw -= dx*0.006;
@@ -6328,7 +6814,7 @@ function updateJoystickLook(dt){
     const mag = Math.hypot(joySmoothX, joySmoothY);
     if(mag < 0.08) return;
     const k = (mag-0.08)/(1-0.08);
-    carLookYaw = clamp(carLookYaw - (joySmoothX/mag) * k * 2.6 * dt, -1.05, 1.05);
+    carLookYaw = clamp(carLookYaw - (joySmoothX/mag) * k * 2.6 * dt, -1.30, 1.30);
     carLookPitch = clamp(carLookPitch - (joySmoothY/mag) * k * 1.8 * dt, -0.42, 0.34);
     return;
   }
@@ -7412,7 +7898,7 @@ function loop(t){
     else if(inCar) altEl.textContent = 'AUTO · VEL '+Math.round(Math.abs(carState.speed))+' km/h';
     else altEl.textContent = 'ALT '+Math.round(playerState.y)+'m';
     if(fps < 28 && lowResDynamic < MAX_RESOLUTION_SCALE){
-      lowResDynamic = Math.min(MAX_RESOLUTION_SCALE, lowResDynamic + 0.7);
+      lowResDynamic = Math.min(MAX_RESOLUTION_SCALE, lowResDynamic + 0.2);
       resize();
     } else if(fps > 50 && lowResDynamic > BASE_RESOLUTION_SCALE){
       lowResDynamic = Math.max(BASE_RESOLUTION_SCALE, lowResDynamic - 0.25);
